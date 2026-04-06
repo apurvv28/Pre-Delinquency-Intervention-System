@@ -18,3 +18,4 @@ reportlab==4.2.2
 Faker==26.0.0
 redis==5.0.7
 pytz==2024.1
+matplotlib==3.10.8

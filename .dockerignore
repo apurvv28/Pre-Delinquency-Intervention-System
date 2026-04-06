@@ -1,0 +1,33 @@
+# Git and editor artifacts
+.git
+.gitignore
+.vscode
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+pie-dashboard/node_modules/
+pie-dashboard/dist/
+
+# Local runtime files
+.env
+*.log
+*.db
+pie.db
+
+# Heavy datasets and generated outputs
+backend/data/pie_sample_multirow.csv
+backend/data/pie_sample_cleaned.csv
+backend/outputs/
+
+# Local notebooks cache
+.ipynb_checkpoints/

@@ -1,0 +1,46 @@
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: apurvv28/pie-backend:latest
+    container_name: pie-backend
+    restart: unless-stopped
+    environment:
+      APP_TIMEZONE: ${APP_TIMEZONE:-Asia/Kolkata}
+      DATABASE_URL: sqlite:///./data/pie.db
+      FRONTEND_URL: http://localhost:8080
+      CORS_ALLOW_ORIGINS: http://localhost:8080
+      UPSTASH_REDIS_REST_URL: ${UPSTASH_REDIS_REST_URL:-}
+      UPSTASH_REDIS_REST_TOKEN: ${UPSTASH_REDIS_REST_TOKEN:-}
+      SKIP_SEED_ON_STARTUP: ${SKIP_SEED_ON_STARTUP:-false}
+      DISABLE_TRANSACTION_STREAM: ${DISABLE_TRANSACTION_STREAM:-false}
+      PRESEED_TRANSACTIONS_ON_STARTUP: ${PRESEED_TRANSACTIONS_ON_STARTUP:-false}
+      DISABLE_RETRAINING_SCHEDULER: ${DISABLE_RETRAINING_SCHEDULER:-true}
+      USE_ADVANCED_STREAM_PRODUCER: ${USE_ADVANCED_STREAM_PRODUCER:-true}
+      MODEL_PATH: ${MODEL_PATH:-models/pie_lightgbm_model_v2.pkl}
+      FEATURES_PATH: ${FEATURES_PATH:-models/pie_feature_columns_v2.pkl}
+      THRESHOLD_PATH: ${THRESHOLD_PATH:-models/pie_threshold_v2.pkl}
+    ports:
+      - "8000:8000"
+    volumes:
+      - pie_sqlite_data:/app/data
+      - ./models:/app/models:ro
+      - ./backend/models:/app/backend/models:ro
+
+  frontend:
+    build:
+      context: ./pie-dashboard
+      dockerfile: Dockerfile
+      args:
+        VITE_API_BASE_URL: /api
+    image: apurvv28/pie-frontend:latest
+    container_name: pie-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "8080:80"
+
+volumes:
+  pie_sqlite_data:
