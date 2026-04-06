@@ -1,0 +1,192 @@
+@import "tailwindcss";
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Inter:wght@400;500;600&family=Syne:wght@500;700&display=swap');
+
+:root {
+  color-scheme: light;
+  --pie-bg: #F4F6F9;
+  --pie-surface: #FFFFFF;
+  --pie-border: #E2E6ED;
+  --pie-border-subtle: #F0F2F5;
+  --pie-brand: #003366;
+  --pie-accent: #0057B8;
+  --pie-text: #0F172A;
+  --pie-text-secondary: #475569;
+  --pie-muted: #94A3B8;
+}
+
+@layer base {
+  * {
+    box-sizing: border-box;
+  }
+
+  html,
+  body {
+    @apply antialiased;
+    background: var(--pie-bg);
+    color: var(--pie-text);
+    font-family: 'Inter', sans-serif;
+    margin: 0;
+    min-height: 100%;
+  }
+
+  #root {
+    min-height: 100vh;
+  }
+
+  h1,
+  h2,
+  h3,
+  h4 {
+    font-family: 'Syne', sans-serif;
+    letter-spacing: 0.01em;
+    color: var(--pie-brand);
+  }
+
+  .font-dm-mono {
+    font-family: 'DM Mono', monospace;
+  }
+
+  .font-syne {
+    font-family: 'Syne', sans-serif;
+  }
+}
+
+@layer components {
+  .markdown-content {
+    @apply space-y-3;
+  }
+
+  .markdown-content h1,
+  .markdown-content h2,
+  .markdown-content h3,
+  .markdown-content h4,
+  .markdown-content h5,
+  .markdown-content h6 {
+    font-family: 'Syne', sans-serif;
+    @apply font-bold text-[#0F172A] mt-4 mb-2;
+  }
+
+  .markdown-content h2 {
+    @apply text-xl border-b border-[#E2E6ED] pb-2;
+  }
+
+  .markdown-content h3 {
+    @apply text-lg text-[#0057B8];
+  }
+
+  .markdown-content p {
+    @apply text-[#475569] leading-relaxed;
+  }
+
+  .markdown-content ol,
+  .markdown-content ul {
+    @apply ml-4 space-y-1;
+  }
+
+  .markdown-content li {
+    @apply text-[#475569];
+  }
+
+  .markdown-content strong {
+    @apply text-[#0F172A] font-semibold;
+  }
+
+  .markdown-content em {
+    @apply text-[#334155] italic;
+  }
+
+  .markdown-content code {
+    font-family: 'DM Mono', monospace;
+    @apply bg-white px-2 py-1 rounded text-[#0057B8] text-xs;
+  }
+
+  .markdown-content pre {
+    @apply bg-white p-4 rounded-lg overflow-x-auto border border-[#E2E6ED];
+  }
+
+  .markdown-content pre code {
+    @apply bg-transparent p-0 rounded-none;
+  }
+
+  .markdown-content blockquote {
+    @apply border-l-4 border-[#0057B8] pl-4 py-2 italic text-[#94A3B8];
+  }
+
+  .markdown-content table {
+    @apply w-full border-collapse;
+  }
+
+  .markdown-content th,
+  .markdown-content td {
+    @apply border border-[#E2E6ED] px-4 py-2 text-left;
+  }
+
+  .markdown-content th {
+    @apply bg-[#F4F6F9] font-semibold text-[#94A3B8] text-[11px] uppercase tracking-[0.08em];
+  }
+
+  .markdown-content td {
+    @apply text-[#475569];
+  }
+
+  .markdown-content tr:hover {
+    @apply bg-[#F8FAFC];
+  }
+
+  .markdown-content a {
+    @apply text-[#0057B8] underline hover:text-[#004A9E];
+  }
+}
+
+.animate-critical-pulse {
+  animation: criticalPulse 1.8s ease-in-out infinite;
+}
+
+.animate-card-enter {
+  animation: cardEnter 420ms ease-out both;
+}
+
+@keyframes cardEnter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes criticalPulse {
+  0% {
+    box-shadow: 0 0 0 rgba(192, 57, 43, 0.08);
+  }
+  50% {
+    box-shadow: 0 0 0 rgba(192, 57, 43, 0.08);
+  }
+  100% {
+    box-shadow: 0 0 0 rgba(192, 57, 43, 0.08);
+  }
+}
+
+.markdown-content p {
+  margin-bottom: 1rem;
+}
+.markdown-content strong {
+  font-weight: 700;
+  color: #0F172A;
+}
+.markdown-content ul {
+  list-style-type: disc;
+  padding-left: 1.5rem;
+  margin-bottom: 1rem;
+}
+.markdown-content ul li {
+  margin-bottom: 0.25rem;
+}
+.markdown-content ol {
+  list-style-type: decimal;
+  padding-left: 1.5rem;
+  margin-bottom: 1rem;
+}
+

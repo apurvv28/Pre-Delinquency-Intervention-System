@@ -1,0 +1,34 @@
+[
+  {
+    "runAt": "2026-04-05T08:30:00.000000+00:00",
+    "modelVersion": "contextual-xgb-v1",
+    "modelType": "xgboost",
+    "threshold": 0.42,
+    "accuracy": 0.9847,
+    "precision": 0.9531,
+    "recall": 0.9721,
+    "f1": 0.9625,
+    "auc": 0.9891,
+    "driftScore": 0.05,
+    "triggerReason": "initial-training",
+    "datasetRows": 57539,
+    "featureCount": 59,
+    "dataSource": "xg-datasets"
+  },
+  {
+    "runAt": "2026-04-05T09:36:44.613963+00:00",
+    "modelVersion": "contextual-xgb-v1",
+    "modelType": "xgboost",
+    "threshold": 0.42,
+    "accuracy": 0.9951,
+    "precision": 0.9946,
+    "recall": 0.9896,
+    "f1": 0.9921,
+    "auc": 0.9999,
+    "driftScore": 0.0,
+    "triggerReason": "manual-training",
+    "datasetRows": 57539,
+    "featureCount": 59,
+    "dataSource": "xg-datasets"
+  }
+]
