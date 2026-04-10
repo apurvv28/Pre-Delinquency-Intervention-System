@@ -19,6 +19,27 @@ A real-time, ML-driven risk intelligence platform that predicts customer delinqu
 - Contributors
 - Conclusion
 
+## 📚 Comprehensive Documentation
+
+This project includes detailed technical and theoretical documentation:
+
+1. **[PROJECT_THEORY.md](docs/PROJECT_THEORY.md)** — Comprehensive theoretical overview including:
+   - Problem statement and business context
+   - Conceptual ML architecture (dual-model ensemble approach)
+   - System components and operational workflows
+   - Risk scoring semantics and intervention orchestration
+   - MLOps & governance framework
+   - Future enhancements and innovations
+
+2. **[TECHNICAL_MATHEMATICAL_DETAILS.md](docs/TECHNICAL_MATHEMATICAL_DETAILS.md)** — Deep technical dive including:
+   - Feature engineering (transaction-level and contextual features)
+   - Model architecture & mathematical formulations (LightGBM, XGBoost, fusion engine)
+   - Scoring calibration and threshold optimization
+   - Drift detection metrics (PSI, KS test, Jensen-Shannon divergence)
+   - Retraining workflows and optimization strategies
+   - Data flow and system architecture
+   - Implementation pseudocode and performance analysis
+
 ## Project Description
 PIE (Pre-Delinquency Intelligence Engine) is built to shift lending and collections workflows from reactive to proactive.
 
