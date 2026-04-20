@@ -577,6 +577,46 @@ def predict_contextual_risk(customer_id: str, base_risk_score: float) -> dict | 
 
     profile_data = get_customer_profile(customer_id)
     history = get_customer_transactions(customer_id)
+
+    # Cache can be empty for manual predict paths; fall back to SQLite directly.
+    if not profile_data:
+        with SessionLocal() as db:
+            profile_row = db.query(CustomerProfile).filter(CustomerProfile.customer_id == customer_id).first()
+            if profile_row:
+                profile_data = {
+                    "customer_id": profile_row.customer_id,
+                    "loan_amount": profile_row.loan_amount,
+                    "monthly_income": profile_row.monthly_income,
+                    "account_age_months": profile_row.account_age_months,
+                    "occupation": profile_row.occupation,
+                    "loan_type": profile_row.loan_type,
+                    "spending_culture": profile_row.spending_culture,
+                    "risk_segment": profile_row.risk_segment,
+                    "branch": profile_row.branch,
+                }
+
+    if not history:
+        with SessionLocal() as db:
+            tx_rows = (
+                db.query(CustomerTransaction)
+                .filter(CustomerTransaction.customer_id == customer_id)
+                .order_by(CustomerTransaction.transaction_time.asc())
+                .limit(180)
+                .all()
+            )
+            history = [
+                {
+                    "amount": tx.amount,
+                    "days_since_last_payment": tx.days_since_last_payment,
+                    "previous_declines_24h": tx.previous_declines_24h,
+                    "is_international": tx.is_international,
+                    "merchant_category": tx.merchant_category,
+                    "risk_score": tx.risk_score,
+                    "event_type": "",
+                }
+                for tx in tx_rows
+            ]
+
     if not profile_data or not history:
         return None
 

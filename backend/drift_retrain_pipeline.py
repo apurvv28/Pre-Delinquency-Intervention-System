@@ -391,7 +391,21 @@ def trigger_colab_retraining(
             response.raise_for_status()
             result = response.json()
 
-        job.status = str(result.get("status", "running"))
+        remote_status = str(result.get("status", "running")).strip().lower()
+        if remote_status in {"failed", "error"}:
+            remote_error = str(
+                result.get("error")
+                or result.get("message")
+                or result.get("detail")
+                or "Colab retraining failed"
+            )
+            job.status = "failed"
+            job.response_json = json.dumps(result)
+            job.completed_at = get_ist_now()
+            db.commit()
+            raise RuntimeError(f"Colab retraining failed: {remote_error}")
+
+        job.status = remote_status or "running"
         job.response_json = json.dumps(result)
         job.updated_at = get_ist_now()
         db.commit()
@@ -416,7 +430,12 @@ def trigger_colab_retraining(
         }
     except Exception as exc:
         job.status = "failed"
-        job.response_json = json.dumps({"error": str(exc)})
+        job.response_json = json.dumps(
+            {
+                "status": "failed",
+                "error": str(exc),
+            }
+        )
         job.completed_at = get_ist_now()
         db.commit()
         raise

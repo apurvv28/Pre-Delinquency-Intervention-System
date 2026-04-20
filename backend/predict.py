@@ -112,11 +112,13 @@ def activate_model_artifacts(
 
 def get_risk_bucket(score: float) -> str:
     # Conservative portfolio calibration: keep most customers in normal unless risk is materially elevated.
-    if score < 55:
+    if score < 40:
+        return "LOW_RISK"
+    if score < 60:
         return "LOW_RISK"
     if score < 75:
         return "HIGH_RISK"
-    if score < 98.5:
+    if score < 99:
         return "CRITICAL"
     return "VERY_CRITICAL"
 

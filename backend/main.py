@@ -3,7 +3,7 @@ import threading
 
 from dotenv import load_dotenv
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import FastAPI
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.cache import ping_redis, stream_create_group
@@ -20,6 +20,7 @@ from backend.simulator import stream_customer_transactions
 from backend.stream_producer import start_advanced_stream_producer, stop_advanced_stream_producer
 from backend.stream_consumer import start_stream_consumer, stop_stream_consumer
 from backend.retraining import ensure_baseline_history
+from backend.websocket_manager import manager
 
 load_dotenv()
 
@@ -47,6 +48,26 @@ app.include_router(drift_retraining_router)
 app.include_router(intervention_router)
 
 scheduler = BackgroundScheduler(timezone="Asia/Kolkata")
+
+
+@app.websocket("/ws/stream")
+async def websocket_endpoint(websocket: WebSocket):
+    """WebSocket endpoint for real-time transaction and score updates."""
+    await manager.connect(websocket)
+    try:
+        while True:
+            # Keep connection alive, receive any client messages if needed
+            data = await websocket.receive_text()
+            # Echo back or handle client commands (optional)
+            if data == "ping":
+                await websocket.send_text("pong")
+    except WebSocketDisconnect:
+        await manager.disconnect(websocket)
+    except Exception as e:
+        print(f"[WS] Error: {e}")
+        await manager.disconnect(websocket)
+
+
 
 
 def _scheduled_drift_check() -> None:

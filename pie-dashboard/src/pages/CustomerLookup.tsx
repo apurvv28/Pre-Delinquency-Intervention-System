@@ -12,19 +12,35 @@ import {
 } from 'recharts';
 import ReactMarkdown from 'react-markdown';
 import { pieApi } from '../api/pie';
-import RiskBadge from '../components/RiskBadge';
 import ScoreRing from '../components/ScoreRing';
 import LoadingSpinner from '../components/LoadingSpinner';
+import SkeletonLoader from '../components/SkeletonLoader';
+import { normalizeRiskTier } from '../lib/risk';
 import { CustomerProfileSummary, CustomerTransactionPoint } from '../types';
+
+type LegacyRiskBucket = 'LOW_RISK' | 'HIGH_RISK' | 'CRITICAL' | 'VERY_CRITICAL';
+
+function toLegacyBucket(bucket?: string | null, score?: number | null): LegacyRiskBucket {
+  const tier = normalizeRiskTier(bucket ?? undefined, score ?? 0);
+  if (tier === 'VERY_CRITICAL') return 'VERY_CRITICAL';
+  if (tier === 'CRITICAL') return 'CRITICAL';
+  if (tier === 'HIGH') return 'HIGH_RISK';
+  return 'LOW_RISK';
+}
 
 export default function CustomerLookup() {
   const { data: customers = [], isLoading: customersLoading } = useQuery({
     queryKey: ['customers'],
     queryFn: pieApi.getCustomers,
+    refetchInterval: 30000,
+    staleTime: 15000,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: false,
   });
 
   const [searchInput, setSearchInput] = useState('');
   const [selectedCustomerId, setSelectedCustomerId] = useState('');
+  const [explanationEnabled, setExplanationEnabled] = useState(false);
 
   useEffect(() => {
     if (!selectedCustomerId && customers.length > 0) {
@@ -47,30 +63,48 @@ export default function CustomerLookup() {
         pieApi.getCustomerTransactions(selectedCustomerId),
       ]);
 
-      let explanationData = null;
-      try {
-        explanationData = await pieApi.getExplanation(selectedCustomerId);
-      } catch (err) {
-        console.warn('Failed to fetch XAI explanation:', err);
-      }
-
       return {
         currentScore: scoreData,
         history: historyData || [],
         transactions: txData.transactions || [],
         profile: txData.profile,
-        explanation: explanationData,
+        explanation: null,
       };
     },
     enabled: !!selectedCustomerId,
-    retry: false,
-    refetchInterval: 5000,
+    retry: 2,
+    refetchInterval: 30000,
+    staleTime: 15000,
+    refetchOnWindowFocus: false,
+  });
+
+  useEffect(() => {
+    setExplanationEnabled(false);
+    if (!selectedCustomerId || !data) return;
+    const timer = window.setTimeout(() => setExplanationEnabled(true), 300);
+    return () => window.clearTimeout(timer);
+  }, [selectedCustomerId, data]);
+
+  const {
+    data: explanationData,
+    isLoading: explanationLoading,
+    isFetching: explanationFetching,
+    error: explanationError,
+  } = useQuery({
+    queryKey: ['explanation', selectedCustomerId],
+    queryFn: () => pieApi.getExplanation(selectedCustomerId),
+    enabled: !!selectedCustomerId && !!data && explanationEnabled,
+    retry: 3,
+    staleTime: 60000,
+    refetchOnWindowFocus: false,
   });
 
   const currentScore = data?.currentScore || null;
   const history = data?.history || [];
   const transactions = data?.transactions || [];
   const profile = data?.profile || selectedCustomer;
+  const explanation = explanationData;
+  const currentScoreBucket = currentScore ? toLegacyBucket(currentScore.risk_bucket, currentScore.risk_score) : 'LOW_RISK';
 
   const errorObj = queryError as { response?: { data?: { detail?: string } } } | undefined;
   const error = queryError
@@ -165,16 +199,15 @@ export default function CustomerLookup() {
                           : 'border-[#E2E6ED] bg-[#F4F6F9] hover:border-[#CBD5E1] hover:bg-white'
                       }`}
                     >
-                      <div className="flex items-center justify-between gap-3">
+                      <div className="flex flex-col gap-2">
                         <div>
                           <p className="font-dm-mono text-sm text-[#0F172A]">{customer.customer_id}</p>
                           <p className="text-xs text-[#94A3B8]">{customer.name}</p>
                         </div>
-                        <RiskBadge bucket={(customer.latest_risk_bucket ?? 'LOW_RISK') as 'LOW_RISK' | 'HIGH_RISK' | 'CRITICAL' | 'VERY_CRITICAL'} />
+                        <p className="text-[11px] uppercase tracking-[0.14em] text-[#94A3B8]">
+                          {customer.branch} · {customer.loan_type}
+                        </p>
                       </div>
-                      <p className="mt-2 text-[11px] uppercase tracking-[0.14em] text-[#94A3B8]">
-                        {customer.branch} · {customer.loan_type}
-                      </p>
                     </button>
                   );
                 })}
@@ -197,17 +230,17 @@ export default function CustomerLookup() {
               )}
 
               <article className="col-span-4 rounded-xl border border-[#E2E6ED] bg-white p-5">
-                <div className="flex items-start justify-between gap-3">
-                  <div>
-                    <p className="text-xs uppercase tracking-[0.16em] text-[#94A3B8]">Customer profile</p>
-                    <h3 className="mt-1 font-syne text-2xl text-[#0F172A]">{profile.name}</h3>
-                    <p className="mt-1 text-sm text-[#94A3B8]">{profile.branch} · {profile.loan_type}</p>
-                  </div>
-                  <RiskBadge bucket={(currentScore.risk_bucket as 'LOW_RISK' | 'HIGH_RISK' | 'CRITICAL' | 'VERY_CRITICAL')} />
+                <div>
+                  <p className="text-xs uppercase tracking-[0.16em] text-[#94A3B8]">Customer profile</p>
+                  <h3 className="mt-1 font-syne text-2xl text-[#0F172A]">{profile.name}</h3>
+                  <p className="mt-1 text-sm text-[#94A3B8]">{profile.branch} · {profile.loan_type}</p>
                 </div>
 
                 <div className="mt-5 flex flex-col items-center rounded-2xl border border-[#E2E6ED] bg-[#F4F6F9] py-4">
-                  <ScoreRing score={currentScore.risk_score} bucket={currentScore.risk_bucket as 'LOW_RISK' | 'HIGH_RISK' | 'CRITICAL' | 'VERY_CRITICAL'} />
+                  <ScoreRing score={currentScore.risk_score} bucket={currentScoreBucket} />
+                  <p className="mt-3 font-dm-mono text-sm text-[#0F172A]">
+                    Risk score: {currentScore.risk_score.toFixed(2)}%
+                  </p>
                 </div>
 
                 <dl className="mt-5 grid grid-cols-2 gap-3 text-sm">
@@ -274,7 +307,21 @@ export default function CustomerLookup() {
                   <div className="col-span-7 rounded-xl border border-[#E2E6ED] bg-[#F4F6F9] p-4">
                     <h3 className="border-b border-[#E2E6ED] pb-2 font-syne text-xl text-[#0F172A]">AI pre-default analysis</h3>
                     <div className="markdown-content mt-4 text-sm leading-6 text-[#475569]">
-                      {data?.explanation ? <ReactMarkdown>{data.explanation.explanation}</ReactMarkdown> : <p>No explanation available yet.</p>}
+                      {(!explanationEnabled || explanationLoading || explanationFetching) && (
+                        <div className="space-y-3">
+                          <SkeletonLoader lines={5} />
+                          <p className="text-xs text-[#94A3B8]">Generating AI analysis...</p>
+                        </div>
+                      )}
+                      {explanationEnabled && !explanationLoading && !explanationFetching && explanation && (
+                        <ReactMarkdown>{explanation.explanation}</ReactMarkdown>
+                      )}
+                      {explanationEnabled && !explanationLoading && !explanationFetching && !explanation && !explanationError && (
+                        <p>No explanation available yet.</p>
+                      )}
+                      {explanationEnabled && !explanationLoading && !explanationFetching && explanationError && (
+                        <p className="text-[#B45309]">AI analysis is temporarily unavailable. Please retry in a moment.</p>
+                      )}
                     </div>
                   </div>
                 </div>

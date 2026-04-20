@@ -36,11 +36,20 @@ async def get_both_models_monitoring(db: Session = Depends(get_db)):
 
 @router.post("/retrain")
 async def retrain_now(db: Session = Depends(get_db)):
-    report = build_monitoring_report(db)
-    result = retrain_model(trigger_reason="manual", drift_score=float(report["drift"]["driftScore"]))
+    before = build_monitoring_report(db)
+    try:
+        result = retrain_model(
+            trigger_reason="manual",
+            drift_score=float(before["drift"]["driftScore"]),
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Manual retraining failed: {exc}") from exc
+
+    after = build_monitoring_report(db)
     return {
         "status": "retrained",
-        "monitoring": report,
+        "monitoringBefore": before,
+        "monitoring": after,
         "result": result,
     }
 

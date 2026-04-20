@@ -226,4 +226,9 @@ export const pieApi = {
   },
 
   toRiskTier: (score: number) => fromScore(score),
+
+  restartStream: async (): Promise<{ status: string; message: string; cleared: Record<string, unknown>; timestamp: string }> => {
+    const response = await apiClient.post<{ status: string; message: string; cleared: Record<string, unknown>; timestamp: string }>('/api/stream/restart', {});
+    return response.data;
+  },
 };

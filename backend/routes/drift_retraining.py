@@ -3,9 +3,11 @@ from datetime import datetime, timedelta, timezone
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from sqlalchemy import delete
 from sqlalchemy.orm import Session
 
-from backend.database import get_db
+from backend.cache import redis
+from backend.database import CustomerTransaction, RiskScore, get_db
 from backend.timezone_util import get_ist_now
 from backend.drift_retrain_pipeline import (
     DRIFT_RETRAIN_THRESHOLD,
@@ -159,3 +161,86 @@ async def update_retrain_runtime_config(payload: dict):
         **updated,
         "colabConnection": ping_colab_health(),
     }
+
+
+@router.post("/api/stream/restart")
+async def restart_stream(request: Request, db: Session = Depends(get_db)):
+    """
+    Restart the transaction stream from 0 transactions.
+    This endpoint:
+    1. Deletes all CustomerTransaction records from the database
+    2. Deletes all RiskScore records from the database
+    3. Clears the Redis stream
+    4. Deletes and recreates the consumer group
+    
+    After this, the stream producer/consumer will restart fresh,
+    flowing transactions through the ML models (LightGBM + XGBoost fusion).
+    """
+    actor = _actor_from_request(request)
+    
+    try:
+        # Delete all transactions
+        db.execute(delete(CustomerTransaction))
+        db.commit()
+        tx_count = 0
+        print(f"[STREAM_RESTART] Cleared all CustomerTransaction records")
+        
+        # Delete all risk scores
+        db.execute(delete(RiskScore))
+        db.commit()
+        print(f"[STREAM_RESTART] Cleared all RiskScore records")
+        
+        # Clear Redis stream
+        stream_key = "pie:transactions"
+        consumer_group = "pie-prediction-engine"
+        
+        try:
+            # Delete consumer group (this will clear pending messages)
+            redis.execute("XGROUP", "DESTROY", stream_key, consumer_group, skip_error=True)
+            print(f"[STREAM_RESTART] Deleted consumer group {consumer_group}")
+        except Exception as e:
+            print(f"[STREAM_RESTART] Note: Consumer group deletion: {e}")
+        
+        try:
+            # Delete the entire stream
+            redis.delete(stream_key)
+            print(f"[STREAM_RESTART] Cleared Redis stream {stream_key}")
+        except Exception as e:
+            print(f"[STREAM_RESTART] Note: Stream cleanup: {e}")
+        
+        # Clear risk cache keys
+        try:
+            # Scan and delete all risk: prefixed keys
+            redis.execute("EVAL", """
+                local keys = redis.call('keys', 'risk:*')
+                for i, key in ipairs(keys) do
+                    redis.call('del', key)
+                end
+                return #keys
+            """, 0)
+            print(f"[STREAM_RESTART] Cleared Redis risk cache")
+        except Exception as e:
+            print(f"[STREAM_RESTART] Note: Risk cache cleanup: {e}")
+        
+        return {
+            "status": "success",
+            "message": "Stream restarted successfully",
+            "cleared": {
+                "transactions": "all",
+                "risk_scores": "all",
+                "redis_stream": stream_key,
+                "consumer_group": consumer_group,
+                "cache": "risk:*"
+            },
+            "actor": actor,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "next_steps": "Streamed transactions will now flow through LightGBM + XGBoost fusion model and appear in customer registry."
+        }
+        
+    except Exception as e:
+        print(f"[STREAM_RESTART] ERROR: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to restart stream: {str(e)}"
+        )
+

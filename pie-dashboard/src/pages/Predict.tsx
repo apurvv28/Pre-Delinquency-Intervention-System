@@ -6,9 +6,12 @@ import { normalizeRiskTier } from '../lib/risk';
 import { RiskScoreResponse } from '../types';
 
 export default function Predict() {
-  const [customerId, setCustomerId] = useState('CUST-102394');
+  const [customerId, setCustomerId] = useState('CUST-0001');
   const [transactionAmount, setTransactionAmount] = useState(1200);
-  const [transactionReason, setTransactionReason] = useState('utility payment');
+  const [transactionReason, setTransactionReason] = useState('utilities');
+  const [currentBalance, setCurrentBalance] = useState(25000);
+  const [daysSinceLastPayment, setDaysSinceLastPayment] = useState(2);
+  const [transactionType, setTransactionType] = useState('PURCHASE');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<RiskScoreResponse | null>(null);
@@ -24,6 +27,12 @@ export default function Predict() {
         {
           amount: Number(transactionAmount),
           transaction_reason: transactionReason,
+          merchant_category: transactionReason,
+          event_type: transactionType,
+          current_balance: Number(currentBalance),
+          days_since_last_payment: Number(daysSinceLastPayment),
+          previous_declines_24h: 0,
+          is_international: false,
         },
         true,
       );
@@ -47,7 +56,7 @@ export default function Predict() {
     <section className="grid grid-cols-[1.6fr_1fr] gap-5 p-6">
       <article className="rounded-xl border border-[#E2E6ED] bg-white p-5">
         <h2 className="font-syne text-2xl text-[#0F172A]">Prediction Engine</h2>
-        <p className="text-sm text-[#94A3B8]">Run a quick risk check using basic transaction inputs.</p>
+        <p className="text-sm text-[#94A3B8]">Run a risk check using a realistic payment flow and inspect the LightGBM and XGBoost outputs separately.</p>
 
         <form className="mt-5 space-y-4" onSubmit={handleSubmit}>
           <div>
@@ -81,6 +90,49 @@ export default function Predict() {
               onChange={(e) => setTransactionReason(e.target.value)}
               placeholder="e.g. rent, utility payment, electronics"
               className="w-full rounded-lg border border-[#E2E6ED] bg-white px-3 py-2 text-[#0F172A] outline-none ring-[#0057B8]/20 focus:ring"
+            />
+          </div>
+
+          <div>
+            <label className="mb-1 block text-xs uppercase tracking-[0.14em] text-[#475569]">Transaction Type</label>
+            <select
+              value={transactionType}
+              onChange={(e) => setTransactionType(e.target.value)}
+              className="w-full rounded-lg border border-[#E2E6ED] bg-white px-3 py-2 text-[#0F172A] outline-none ring-[#0057B8]/20 focus:ring"
+            >
+              <option value="PURCHASE">PURCHASE</option>
+              <option value="CARD_SWIPE">CARD_SWIPE</option>
+              <option value="ONLINE_PURCHASE">ONLINE_PURCHASE</option>
+              <option value="PAYMENT">PAYMENT</option>
+              <option value="INCOME_CREDIT">INCOME_CREDIT</option>
+              <option value="PARTIAL_PAYMENT">PARTIAL_PAYMENT</option>
+              <option value="SETTLEMENT_OFFER">SETTLEMENT_OFFER</option>
+            </select>
+          </div>
+
+          <div>
+            <label className="mb-1 block text-xs uppercase tracking-[0.14em] text-[#475569]">Current Balance</label>
+            <input
+              required
+              min={0}
+              type="number"
+              step="0.01"
+              value={currentBalance}
+              onChange={(e) => setCurrentBalance(Number(e.target.value))}
+              className="w-full rounded-lg border border-[#E2E6ED] bg-white px-3 py-2 font-dm-mono text-[#0F172A] outline-none ring-[#0057B8]/20 focus:ring"
+            />
+          </div>
+
+          <div>
+            <label className="mb-1 block text-xs uppercase tracking-[0.14em] text-[#475569]">Days Since Last Payment</label>
+            <input
+              required
+              min={0}
+              type="number"
+              step="1"
+              value={daysSinceLastPayment}
+              onChange={(e) => setDaysSinceLastPayment(Number(e.target.value))}
+              className="w-full rounded-lg border border-[#E2E6ED] bg-white px-3 py-2 font-dm-mono text-[#0F172A] outline-none ring-[#0057B8]/20 focus:ring"
             />
           </div>
 
@@ -132,6 +184,26 @@ export default function Predict() {
             <div className="flex justify-center">
               <RiskTierBadge tier={resultTier} />
             </div>
+            <div className="grid grid-cols-3 gap-3 text-sm">
+              <div className="rounded-lg border border-[#E2E6ED] bg-[#F4F6F9] p-3">
+                <p className="text-[11px] uppercase tracking-[0.14em] text-[#94A3B8]">LightGBM</p>
+                <p className="mt-1 font-dm-mono text-lg text-[#0F172A]">{result.base_model_risk_score != null ? `${result.base_model_risk_score.toFixed(2)}%` : 'N/A'}</p>
+              </div>
+              <div className="rounded-lg border border-[#E2E6ED] bg-[#F4F6F9] p-3">
+                <p className="text-[11px] uppercase tracking-[0.14em] text-[#94A3B8]">XGBoost</p>
+                <p className="mt-1 font-dm-mono text-lg text-[#0F172A]">{result.context_model_risk_score != null ? `${result.context_model_risk_score.toFixed(2)}%` : 'N/A (skipped)'}</p>
+              </div>
+              <div className="rounded-lg border border-[#E2E6ED] bg-[#F4F6F9] p-3">
+                <p className="text-[11px] uppercase tracking-[0.14em] text-[#94A3B8]">Final</p>
+                <p className="mt-1 font-dm-mono text-lg text-[#0F172A]">{result.final_model_risk_score != null ? `${result.final_model_risk_score.toFixed(2)}%` : `${result.risk_score.toFixed(2)}%`}</p>
+              </div>
+            </div>
+            {result.context_model_risk_score == null && (
+              <p className="rounded-lg border border-[#E2E6ED] bg-white px-3 py-2 text-xs text-[#64748B]">
+                Contextual XGBoost scoring can be skipped for clean payment/income events by backend safety logic.
+                Use PURCHASE/CARD_SWIPE to compare both model outputs.
+              </p>
+            )}
             <div className="rounded-lg border border-[#E2E6ED] bg-white p-3">
               <p className="text-xs uppercase tracking-[0.14em] text-[#94A3B8]">Risk Summary</p>
               <p className="mt-1 text-sm text-[#0F172A]">

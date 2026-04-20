@@ -8,8 +8,10 @@ Reads from the pie:transactions Redis stream via XREADGROUP so that:
     messages before moving to new ones, preventing data loss.
   • The per-customer stream-event counter lives in Redis (HINCRBY), avoiding
     an expensive COUNT(*) scan on every event (BUG-19).
+  • WebSocket broadcasts push real-time updates to connected clients.
 """
 
+import asyncio
 import json
 import os
 import threading
@@ -26,6 +28,7 @@ from backend.cache import (
 from backend.database import CustomerTransaction, RiskScore, SessionLocal
 from backend.predict import predict_risk
 from backend.timezone_util import get_ist_now
+from backend.websocket_manager import manager
 
 STREAM_KEY = os.getenv("REDIS_STREAM_KEY", "pie:transactions")
 STREAM_CONSUMER_GROUP = os.getenv("REDIS_CONSUMER_GROUP", "pie-prediction-engine")
@@ -41,6 +44,15 @@ consumer_running: bool = False
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _run_async_broadcast(coro) -> None:
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        asyncio.run(coro)
+    else:
+        asyncio.create_task(coro)
 
 def _merchant_category_for_event_type(event_type: str) -> str:
     return {
@@ -293,6 +305,42 @@ def _process_transaction_event(event_id: str, event_data: dict) -> None:
         streamed_count = increment_customer_stream_count(customer_id)
         if streamed_count % RISK_REFRESH_EVERY_N == 0:
             _refresh_customer_risk_score(db, customer_id)
+
+        # --- Broadcast to WebSocket clients for real-time updates ---
+        # Run async broadcast in a thread since we're in a sync context
+        try:
+            # Prepare broadcast data
+            tx_broadcast = {
+                "customer_id": customer_id,
+                "transaction_index": next_index,
+                "amount": amount,
+                "balance_after": balance_after,
+                "days_since_last_payment": days_since_last_payment,
+                "merchant_category": merchant_category,
+                "is_international": is_international,
+                "transaction_time": tx_time.isoformat(),
+                "risk_score": risk_score,
+                "risk_bucket": risk_bucket,
+            }
+            
+            score_update = {
+                "customer_id": customer_id,
+                "risk_score": risk_score,
+                "risk_bucket": risk_bucket,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+            
+            # Schedule async broadcasts
+            _run_async_broadcast(manager.broadcast_transaction(tx_broadcast))
+            _run_async_broadcast(manager.broadcast_score_update(customer_id, risk_score, risk_bucket))
+            _run_async_broadcast(manager.broadcast_model_output("transaction_processed", {
+                "customer_id": customer_id,
+                "transaction_index": next_index,
+                "fusion_score": risk_score,
+                "fusion_bucket": risk_bucket,
+            }))
+        except Exception as ws_err:
+            print(f"[STREAM_CONSUMER] WebSocket broadcast error: {ws_err}")
 
         print(
             f"[STREAM_CONSUMER] OK | Event: {event_id} | Customer: {customer_id} | "

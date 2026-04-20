@@ -55,7 +55,7 @@ export default function ScoreRing({ score, bucket }: ScoreRingProps) {
       </svg>
       <div className="absolute flex flex-col items-center justify-center">
         <span className="text-4xl font-extrabold text-[#0F172A]">
-          {animatedScore.toFixed(0)}
+          {animatedScore.toFixed(2)}
         </span>
         <span className="text-xs text-[#94A3B8] font-medium">/ 100</span>
       </div>

@@ -54,7 +54,14 @@ function exportCsv(rows: RegistryRow[]) {
 }
 
 export default function Registry() {
-  const { data: customers = [] } = useQuery({ queryKey: ['registryRows'], queryFn: pieApi.getCustomers });
+  const { data: customers = [] } = useQuery({
+    queryKey: ['registryRows'],
+    queryFn: pieApi.getCustomers,
+    refetchInterval: 30000,
+    staleTime: 30000,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: false,
+  });
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [activeRow, setActiveRow] = useState<RegistryRow | null>(null);
 

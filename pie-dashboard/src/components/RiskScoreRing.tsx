@@ -34,7 +34,7 @@ export default function RiskScoreRing({ score, tier, size = 170 }: RiskScoreRing
         />
       </svg>
       <div className="absolute flex flex-col items-center">
-        <span className="font-dm-mono text-4xl text-[#0F172A]">{progress.toFixed(1)}%</span>
+        <span className="font-dm-mono text-4xl text-[#0F172A]">{progress.toFixed(2)}%</span>
         <span className="text-[10px] uppercase tracking-[0.2em] text-[#94A3B8]">{riskTierLabel(tier)}</span>
       </div>
     </div>

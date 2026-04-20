@@ -1,5 +1,5 @@
-import { useMemo } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { useMemo, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import {
   CartesianGrid,
   Cell,
@@ -16,22 +16,43 @@ import { pieApi } from '../api/pie';
 import { normalizeRiskTier, riskTierStyles } from '../lib/risk';
 import RiskTierBadge from '../components/RiskTierBadge';
 import StatCard from '../components/StatCard';
+import LoadingSpinner from '../components/LoadingSpinner';
+import { useStreamWebSocket, type StreamEvent } from '../hooks/useStreamWebSocket';
 
 export default function Dashboard() {
+  const queryClient = useQueryClient();
+  const [showRestartConfirm, setShowRestartConfirm] = useState(false);
+  const [isRestarting, setIsRestarting] = useState(false);
+  const [lastUpdate, setLastUpdate] = useState<StreamEvent | null>(null);
+  
+  // WebSocket for real-time transaction updates
+  const { isConnected } = useStreamWebSocket((event: StreamEvent) => {
+    setLastUpdate(event);
+  });
+
   const { data: snapshot } = useQuery({
     queryKey: ['metricSnapshot'],
     queryFn: pieApi.getMetricSnapshot,
+    staleTime: 15000,
+    refetchOnWindowFocus: false,
   });
 
   const { data: registry = [] } = useQuery({
     queryKey: ['registryDashboard'],
     queryFn: pieApi.getRegistry,
-    refetchInterval: 5000,
+    refetchInterval: 30000,
+    staleTime: 15000,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: false,
   });
 
   const { data: customers = [] } = useQuery({
     queryKey: ['customersDashboard'],
     queryFn: pieApi.getCustomers,
+    refetchInterval: 30000,
+    staleTime: 30000,
+    refetchIntervalInBackground: false,
+    refetchOnWindowFocus: false,
   });
 
   const distribution = useMemo(() => {
@@ -113,8 +134,83 @@ export default function Dashboard() {
       .slice(0, 8);
   }, [customers]);
 
+  const handleRestartStream = async () => {
+    setIsRestarting(true);
+    try {
+      const result = await pieApi.restartStream();
+      console.log('Stream restart successful:', result);
+      
+      // Invalidate all queries to refresh the dashboard
+      await queryClient.invalidateQueries({ queryKey: ['metricSnapshot'] });
+      await queryClient.invalidateQueries({ queryKey: ['registryDashboard'] });
+      await queryClient.invalidateQueries({ queryKey: ['customersDashboard'] });
+      
+      setShowRestartConfirm(false);
+    } catch (error) {
+      console.error('Stream restart failed:', error);
+      alert(`Failed to restart stream: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    } finally {
+      setIsRestarting(false);
+    }
+  };
+
   return (
     <section className="space-y-5 p-6">
+      <div className="flex items-center justify-between gap-4 mb-4">
+        <div className="flex items-center gap-3">
+          <h1 className="font-syne text-3xl text-[#0F172A]">Dashboard</h1>
+          <div className="flex items-center gap-2 px-3 py-1.5 rounded-lg border border-[#E2E6ED] bg-white text-xs">
+            <div className={`h-2 w-2 rounded-full ${isConnected ? 'bg-green-500' : 'bg-red-500'}`} />
+            <span className="font-medium text-[#475569]">{isConnected ? 'Live' : 'Offline'}</span>
+          </div>
+          {lastUpdate && (
+            <div className="px-3 py-1.5 rounded-lg border border-[#E2E6ED] bg-[#EFF6FF] text-xs font-mono text-[#0057B8] max-w-xs truncate">
+              {lastUpdate.type === 'transaction' 
+                ? `Tx: ${lastUpdate.data.customer_id.slice(0, 8)}... ₹${lastUpdate.data.amount.toFixed(0)}`
+                : lastUpdate.type === 'risk_score_update'
+                  ? `Score: ${lastUpdate.data.customer_id.slice(0, 8)}... ${lastUpdate.data.risk_score.toFixed(2)}%`
+                : 'Model update'}
+            </div>
+          )}
+        </div>
+        <button
+          onClick={() => setShowRestartConfirm(true)}
+          disabled={isRestarting}
+          className="rounded-lg bg-[#003366] px-4 py-2.5 font-semibold text-white transition hover:bg-[#002244] disabled:opacity-50 disabled:cursor-not-allowed flex items-center gap-2"
+        >
+          {isRestarting && <LoadingSpinner />}
+          {isRestarting ? 'Restarting...' : 'Restart Stream'}
+        </button>
+      </div>
+
+      {showRestartConfirm && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50">
+          <div className="rounded-xl border border-[#E2E6ED] bg-white p-6 shadow-lg max-w-md">
+            <h3 className="font-syne text-xl text-[#0F172A]">Restart Stream?</h3>
+            <p className="mt-2 text-sm text-[#475569]">
+              This will delete all existing stream data and transactions, then restart from 0 transactions for all customers.
+              The stream will reflow through the ML models (LightGBM + XGBoost fusion) to recalculate risk scores.
+            </p>
+            <div className="mt-4 flex gap-2 justify-end">
+              <button
+                onClick={() => setShowRestartConfirm(false)}
+                disabled={isRestarting}
+                className="rounded-lg border border-[#CBD5E1] px-3 py-2 text-sm text-[#334155] hover:bg-[#F4F6F9] disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={handleRestartStream}
+                disabled={isRestarting}
+                className="rounded-lg bg-red-600 px-3 py-2 text-sm text-white hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed"
+              >
+                {isRestarting ? 'Restarting...' : 'Restart'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       <div className="grid grid-cols-4 gap-4">
         <StatCard title="Total Active Accounts Monitored" value={snapshot?.totalAccounts ?? 0} tone="cyan" />
         <StatCard title="High Risk Flagged (30d)" value={snapshot?.highRisk30d ?? 0} tone="amber" />

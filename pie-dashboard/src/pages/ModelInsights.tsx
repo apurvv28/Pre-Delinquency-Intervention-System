@@ -33,7 +33,8 @@ export default function ModelInsights() {
   const { data: retrainStatus } = useQuery({
     queryKey: ['retrainStatus'],
     queryFn: () => pieApi.getRetrainingStatus(),
-    refetchInterval: 5000,
+    refetchInterval: 30000,
+    staleTime: 5000,
   });
 
   const { data: modelHistory } = useQuery({

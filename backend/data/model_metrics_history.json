@@ -11,5 +11,18 @@
     "driftScore": 0.0,
     "triggerReason": "manual-schema-reset",
     "datasetRows": 45891
+  },
+  {
+    "runAt": "2026-04-20T22:58:03.677263+05:30",
+    "modelVersion": "retrained-002",
+    "threshold": 0.42,
+    "accuracy": 0.8957,
+    "precision": 0.7733,
+    "recall": 0.8452,
+    "f1": 0.8076,
+    "auc": 0.9548,
+    "driftScore": 0.6034,
+    "triggerReason": "manual_admin:status_fallback",
+    "datasetRows": 45891
   }
 ]
