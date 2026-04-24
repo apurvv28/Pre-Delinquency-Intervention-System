@@ -56,7 +56,7 @@ export default function Predict() {
     <section className="grid grid-cols-[1.6fr_1fr] gap-5 p-6">
       <article className="rounded-xl border border-[#E2E6ED] bg-white p-5">
         <h2 className="font-syne text-2xl text-[#0F172A]">Prediction Engine</h2>
-        <p className="text-sm text-[#94A3B8]">Run a risk check using a realistic payment flow and inspect the LightGBM and XGBoost outputs separately.</p>
+        <p className="text-sm text-[#94A3B8]">Run a risk check using the sequential LightGBM -&gt; XGBoost pipeline and review the final risk score only.</p>
 
         <form className="mt-5 space-y-4" onSubmit={handleSubmit}>
           <div>
@@ -175,7 +175,7 @@ export default function Predict() {
       <article className="rounded-xl border border-[#E2E6ED] bg-white p-5">
         <h3 className="font-syne text-xl text-[#0F172A]">Inference Output</h3>
         {!result ? (
-          <p className="mt-12 text-center text-sm text-[#94A3B8]">Submit the form to render probability, tier, and model pipeline scores.</p>
+          <p className="mt-12 text-center text-sm text-[#94A3B8]">Submit the form to render the final risk probability and tier.</p>
         ) : (
           <div className="mt-4 space-y-4">
             <div className="flex justify-center">
@@ -184,26 +184,10 @@ export default function Predict() {
             <div className="flex justify-center">
               <RiskTierBadge tier={resultTier} />
             </div>
-            <div className="grid grid-cols-3 gap-3 text-sm">
-              <div className="rounded-lg border border-[#E2E6ED] bg-[#F4F6F9] p-3">
-                <p className="text-[11px] uppercase tracking-[0.14em] text-[#94A3B8]">LightGBM</p>
-                <p className="mt-1 font-dm-mono text-lg text-[#0F172A]">{result.base_model_risk_score != null ? `${result.base_model_risk_score.toFixed(2)}%` : 'N/A'}</p>
-              </div>
-              <div className="rounded-lg border border-[#E2E6ED] bg-[#F4F6F9] p-3">
-                <p className="text-[11px] uppercase tracking-[0.14em] text-[#94A3B8]">XGBoost</p>
-                <p className="mt-1 font-dm-mono text-lg text-[#0F172A]">{result.context_model_risk_score != null ? `${result.context_model_risk_score.toFixed(2)}%` : 'N/A (skipped)'}</p>
-              </div>
-              <div className="rounded-lg border border-[#E2E6ED] bg-[#F4F6F9] p-3">
-                <p className="text-[11px] uppercase tracking-[0.14em] text-[#94A3B8]">Final</p>
-                <p className="mt-1 font-dm-mono text-lg text-[#0F172A]">{result.final_model_risk_score != null ? `${result.final_model_risk_score.toFixed(2)}%` : `${result.risk_score.toFixed(2)}%`}</p>
-              </div>
+            <div className="rounded-lg border border-[#E2E6ED] bg-[#F4F6F9] p-3 text-sm text-[#475569]">
+              <p className="text-[11px] uppercase tracking-[0.14em] text-[#94A3B8]">Final Risk Score</p>
+              <p className="mt-1 font-dm-mono text-lg text-[#0F172A]">{result.final_model_risk_score != null ? `${result.final_model_risk_score.toFixed(2)}%` : `${result.risk_score.toFixed(2)}%`}</p>
             </div>
-            {result.context_model_risk_score == null && (
-              <p className="rounded-lg border border-[#E2E6ED] bg-white px-3 py-2 text-xs text-[#64748B]">
-                Contextual XGBoost scoring can be skipped for clean payment/income events by backend safety logic.
-                Use PURCHASE/CARD_SWIPE to compare both model outputs.
-              </p>
-            )}
             <div className="rounded-lg border border-[#E2E6ED] bg-white p-3">
               <p className="text-xs uppercase tracking-[0.14em] text-[#94A3B8]">Risk Summary</p>
               <p className="mt-1 text-sm text-[#0F172A]">

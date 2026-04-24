@@ -14,6 +14,7 @@ from backend.intervention_system import (
     orchestrate_from_latest_scores,
     preview_intervention,
     reject_intervention,
+    send_manual_intervention_email,
     send_test_email,
 )
 
@@ -155,3 +156,34 @@ async def intervention_bulk_approve(payload: dict, db: Session = Depends(get_db)
         except ValueError as exc:
             outcomes.append({"id": intervention_id, "ok": False, "error": str(exc)})
     return {"items": outcomes}
+
+
+@router.post("/manual-send")
+async def manual_send_email(payload: dict):
+    """Admin-triggered manual email to a specific customer.
+
+    Body:
+        customer_id (str): required
+        admin_id (str): optional, defaults to 'admin'
+        engine_tier (int): optional, auto-determined from latest risk score
+    """
+    customer_id = str(payload.get("customer_id") or "").strip()
+    if not customer_id:
+        raise HTTPException(status_code=400, detail="customer_id is required")
+
+    admin_id = str(payload.get("admin_id") or "admin")
+    engine_tier = payload.get("engine_tier")
+    if engine_tier is not None:
+        engine_tier = int(engine_tier)
+
+    try:
+        result = send_manual_intervention_email(
+            customer_id=customer_id,
+            admin_id=admin_id,
+            engine_tier=engine_tier,
+        )
+        return result
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc

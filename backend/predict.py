@@ -139,6 +139,41 @@ def _income_event_safe_cap(
     return round(18.0 + ((normalized ** 0.85) * 36.0), 2)
 
 
+def _unsafe_event_context_floor(first_model_score: float) -> float:
+    """Lower bound for final score on non-safe events.
+
+    Prevents contextual stage from collapsing very high baseline risk into
+    low-risk bands unless the event type is explicitly whitelisted as safe.
+    """
+    if first_model_score >= 95.0:
+        return max(80.0, first_model_score - 15.0)
+    if first_model_score >= 90.0:
+        return max(75.0, first_model_score - 18.0)
+    if first_model_score >= 80.0:
+        return max(68.0, first_model_score - 20.0)
+    if first_model_score >= 70.0:
+        return max(60.0, first_model_score - 18.0)
+    return 0.0
+
+
+def _should_apply_context_floor(raw_payload: dict) -> bool:
+    """Only apply collapse protection when explicit high-risk context exists."""
+    merchant = str(raw_payload.get("merchant_category") or raw_payload.get("transaction_reason") or "").strip().lower()
+    risky_merchant = merchant in {
+        "crypto",
+        "gambling",
+        "crypto exchange",
+        "jewelry",
+        "wire transfer",
+        "cash advance",
+        "luxury goods",
+    }
+    is_international = str(raw_payload.get("is_international", "false")).strip().lower() in {"true", "1", "yes"}
+    days_late = int(raw_payload.get("days_since_last_payment", 0) or 0)
+    declines = int(raw_payload.get("previous_declines_24h", 0) or 0)
+    return bool(risky_merchant or is_international or days_late >= 25 or declines >= 2)
+
+
 # ---------------------------------------------------------------------------
 # Event types that represent EXPECTED, legitimate payments.
 # For these events a large amount is contextually normal (EMI, salary credit).
@@ -352,68 +387,36 @@ def predict_risk(raw_payload: dict, history_context: dict | None = None) -> dict
     first_model_score = round(float(prob) * 100, 2)
     first_model_bucket = get_risk_bucket(first_model_score)
 
-    # Stage 2: contextual risk from XGBoost using customer context and prior model behavior.
-    # Skip contextual scoring for expected payment/income events where LightGBM is already
-    # confident the transaction is clean (score < 45).  The contextual model was not trained
-    # with payment-intent features and would otherwise amplify clean salary/EMI transactions.
+    # Stage 2: sequential contextual risk from XGBoost using the LightGBM score as an input feature.
     customer_id = str(raw_payload.get("customer_id") or "").strip()
-    event_type_raw = str(raw_payload.get("event_type", "")).upper()
-    is_expected_payment_event = event_type_raw in _EXPECTED_PAYMENT_EVENTS
-
-    run_contextual = (
-        bool(customer_id)
-        and not (is_expected_payment_event and first_model_score < 45.0)
-    )
-    context_output = predict_contextual_risk(customer_id, first_model_score) if run_contextual else None
+    run_contextual = bool(customer_id)
+    context_output = predict_contextual_risk(
+        customer_id,
+        first_model_score,
+        history_context=history_context,
+        transaction_context=raw_payload,
+    ) if run_contextual else None
     second_model_score = float(context_output["risk_score"]) if context_output else None
     second_model_bucket = get_risk_bucket(second_model_score) if second_model_score is not None else None
 
-    # -----------------------------------------------------------------------
-    # Stage 3: CONTEXTUAL MODERATION — the XGBoost context model acts as a
-    # moderator, not just a compounding additive signal.
-    #
-    # Fusion logic:
-    #   AGREEMENT   Both high (≥55) or both low (<55)
-    #               → standard weighted blend (70 LightGBM / 30 XGBoost)
-    #               → models reinforce each other
-    #
-    #   DISAGREEMENT LightGBM high (≥55) but XGBoost low (<40)
-    #               → XGBoost says "this customer's context makes the transaction
-    #                  look routine" — apply a dampening multiplier to LightGBM.
-    #               → final = lgbm_score * dampen_factor   (pulls score down)
-    #
-    #   DISAGREEMENT LightGBM low (<55) but XGBoost high (≥60)
-    #               → XGBoost adds contextual concern not visible in this tx alone.
-    #               → standard blend (both still get weighted)
-    #
-    # The dampening factor scales linearly with how confidently XGBoost disagrees:
-    #   dampen = 0.60 when xgb_score = 0   (maximum dampening)
-    #   dampen = 1.00 when xgb_score = 40  (no dampening at the boundary)
-    # -----------------------------------------------------------------------
-    score = first_model_score
-    fusion_mode = "none"   # for audit trail
+    # Stage 3: the sequential model output is the final score. No weighted blend.
+    score = second_model_score if second_model_score is not None else first_model_score
+    fusion_mode = "sequential_xgboost" if second_model_score is not None else "lightgbm_fallback"
+    event_type = str(raw_payload.get("event_type", "")).upper()
 
-    if context_output is not None and second_model_score is not None:
-        lgbm = first_model_score
-        xgb = second_model_score
-
-        lgbm_elevated = lgbm >= 55.0
-        xgb_low       = xgb  <  40.0
-        xgb_high      = xgb  >= 60.0
-
-        if lgbm_elevated and xgb_low:
-            # XGBoost context contradicts LightGBM — dampen the alarm
-            dampen_factor = 0.60 + (xgb / 40.0) * 0.40   # 0.60 → 1.00 as xgb 0 → 40
-            dampen_factor = min(1.0, max(0.60, dampen_factor))
-            score = round(lgbm * dampen_factor, 2)
-            fusion_mode = f"dampened(factor={dampen_factor:.2f},xgb={xgb:.1f})"
-        else:
-            # Standard weighted blend (agreement or XGBoost raising concern)
-            score = round((lgbm * 0.70) + (xgb * 0.30), 2)
-            fusion_mode = "weighted_blend"
+    # Guardrail: for non-safe events, contextual model must not collapse very
+    # high baseline risk into low-risk final bands.
+    if (
+        second_model_score is not None
+        and event_type not in _EXPECTED_PAYMENT_EVENTS
+        and _should_apply_context_floor(raw_payload)
+    ):
+        floor_score = _unsafe_event_context_floor(first_model_score)
+        if floor_score > 0 and score < floor_score:
+            score = floor_score
+            fusion_mode = "operational_guardrail_context_floor"
 
     bucket = get_risk_bucket(score)
-    event_type = str(raw_payload.get("event_type", "")).upper()
 
     # -----------------------------------------------------------------------
     # OPERATIONAL RULE OVERRIDES (Hard Caps based on Intent)
@@ -429,8 +432,6 @@ def predict_risk(raw_payload: dict, history_context: dict | None = None) -> dict
         if first_model_score < 50.0:
             score = min(score, first_model_score)
             bucket = get_risk_bucket(score)
-            if score < 50.0 and score != score:  # just for fusion tracing
-                pass
             fusion_mode = "operational_override_emi"
 
     return {
@@ -445,5 +446,5 @@ def predict_risk(raw_payload: dict, history_context: dict | None = None) -> dict
         "final_model_risk_bucket": bucket,
         "fusion_mode": fusion_mode,
         "event_type": event_type or "UNKNOWN",
-        "pipeline_stage": "ingest->lightgbm->xgboost->contextual_fusion",
+        "pipeline_stage": "ingest->lightgbm->xgboost->final",
     }

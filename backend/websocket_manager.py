@@ -16,10 +16,13 @@ class WebSocketConnectionManager:
     def __init__(self):
         self.active_connections: Set[WebSocket] = set()
         self.lock = asyncio.Lock()
+        self.loop: asyncio.AbstractEventLoop | None = None
 
     async def connect(self, websocket: WebSocket):
         """Accept a WebSocket connection."""
         await websocket.accept()
+        # Keep a reference to the server's running loop for cross-thread broadcasts.
+        self.loop = asyncio.get_running_loop()
         async with self.lock:
             self.active_connections.add(websocket)
         print(f"[WS] Client connected. Total: {len(self.active_connections)}")
@@ -68,7 +71,7 @@ class WebSocketConnectionManager:
         })
 
     async def broadcast_model_output(self, event_type: str, data: dict):
-        """Broadcast raw model output (LightGBM + XGBoost fusion)."""
+        """Broadcast raw model output (LightGBM -> XGBoost sequential pipeline)."""
         await self.broadcast("model_output", {
             "event_type": event_type,
             "data": data,

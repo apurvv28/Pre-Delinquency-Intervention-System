@@ -1,1070 +1,981 @@
-"""
-PIE Advanced Redis Stream Producer
-------------------------------------
-Generates hyper-realistic, edge-case-rich synthetic transaction data that
-stress-tests the LightGBM + XGBoost prediction pipeline.
-
-Bug fixes applied in this revision
------------------------------------
-BUG-05  GHOST_PAYER month tracking now uses simulated-calendar-month crossing,
-         not a fragile day-of-month check.
-BUG-06  Assertion tolerance logic corrected — records after tolerance window,
-         not immediately at cycle 4.
-BUG-07  Scenario expected tiers calibrated to scores the model can actually
-         reach (VERY_CRITICAL reserved for score ≥ 90, not ≥ 98.5).
-BUG-09  _build_model_features() now forwards all rich behavioral fields so
-         calculate_features_from_transaction() can use them properly.
-BUG-11  per_customer_mode uses self.random (seeded) not global random module.
-BUG-12  consumer_lag computed via stream XLEN minus pending, not copied from
-         pending_count.
-BUG-15  Global drift injection is capped: utilization caps at 0.92, DTI at 0.85.
-BUG-16  Scenario A uses feature-level thresholds tuned to the HIGH/CRITICAL
-         score boundary rather than raw DPD values.
-BUG-17  Scenario C injects actual None values for sparse-feature testing.
-MISSING-03 Scenario H simulates 6-month dormancy before sudden activity.
-MISSING-04 Time advance defaults to 72 hours/event (≈12 months in 10 minutes).
-"""
-
 import json
 import os
 import random
 import threading
 import time
-import uuid
 from collections import Counter, deque
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any
 
-from faker import Faker
+import pytz
 
 from backend.cache import (
     append_stream_metric,
     get_hash_fields,
-    get_stream_length,
-    get_stream_pending_count,
     set_hash_fields,
     stream_publish,
 )
-from backend.database import SessionLocal, CustomerProfile
-from backend.timezone_util import get_ist_now
-from backend.predict import get_risk_bucket, predict_risk
+from backend.database import CustomerProfile, SessionLocal
+from backend.predict import predict_risk
 
+IST = pytz.timezone("Asia/Kolkata")
 STREAM_HEALTH_KEY = "pie:stream:health"
-STREAM_ASSERTION_KEY = "pie:stream:assertions"
-STREAM_KEY = os.getenv("REDIS_STREAM_KEY", "pie:transactions")
-STREAM_CONSUMER_GROUP = os.getenv("REDIS_CONSUMER_GROUP", "pie-prediction-engine")
 
-EVENT_TYPES = [
-    "PAYMENT",
-    "MISSED_PAYMENT",
-    "PARTIAL_PAYMENT",
-    "LOAN_INQUIRY",
-    "CREDIT_UTILIZATION_UPDATE",
-    "INCOME_CREDIT",
-    "PENALTY_APPLIED",
-    "LOAN_OPENED",
-    "LOAN_CLOSED",
-    "ADDRESS_CHANGE",
-    "SETTLEMENT_OFFER",
-    "LEGAL_NOTICE_SENT",
-]
-
-ARCHETYPE_WEIGHTS = {
-    "GHOST_PAYER": 0.08,
-    "SLOW_BLEEDER": 0.15,
-    "RECOVERER": 0.10,
-    "FALSE_ALARM": 0.12,
-    "SEASONAL_DEFAULTER": 0.07,
-    "CASCADING_DEFAULTER": 0.06,
-    "SYNTHETIC_FRAUD_SIGNAL": 0.05,
-    "STABLE_GOOD": 0.25,
-    "NEAR_MISS": 0.12,
+# Exact event types requested.
+EVENT_TYPES = {
+    "SALARY_CREDIT",
+    "UPI_DEBIT",
+    "UPI_CREDIT",
+    "ATM_WITHDRAWAL",
+    "EMI_DEBIT",
+    "NEFT_TRANSFER_OUT",
+    "NEFT_TRANSFER_IN",
+    "RTGS_CREDIT",
+    "IMPS_DEBIT",
+    "BILL_PAYMENT",
+    "MERCHANT_PURCHASE",
+    "INTERNATIONAL_DEBIT",
+    "GST_PAYMENT",
+    "INSURANCE_PREMIUM",
+    "SIP_DEBIT",
+    "FD_INTEREST_CREDIT",
+    "PENSION_CREDIT",
+    "CASH_DEPOSIT",
+    "CHEQUE_BOUNCE",
+    "LOAN_DISBURSEMENT_CREDIT",
 }
 
-SCENARIO_IDS = [
-    "A_BOUNDARY_FLOATER",
-    "B_RAPID_ESCALATION",
-    "C_DATA_SPARSITY",
-    "D_INCOME_SHOCK",
-    "E_PARTIAL_PAYMENT_PATTERN",
-    "F_MULTIPLE_SIMULTANEOUS_LOANS_SPIKE",
-    "G_SETTLEMENT_OFFER_ACCEPTED",
-    "H_ZOMBIE_ACCOUNT",
-    "I_NPA_BOUNDARY",
-    "J_FEATURE_DRIFT_INJECTION",
+CREDIT_EVENTS = {
+    "SALARY_CREDIT",
+    "UPI_CREDIT",
+    "NEFT_TRANSFER_IN",
+    "RTGS_CREDIT",
+    "FD_INTEREST_CREDIT",
+    "PENSION_CREDIT",
+    "CASH_DEPOSIT",
+    "LOAN_DISBURSEMENT_CREDIT",
+}
+
+# Scenario codes map to A-J requirements.
+SCENARIO_CODES = [
+    "A_SALARY_DELAY_STRESS",
+    "B_EMI_STACK_STRESS",
+    "C_INCOME_STABILITY",
+    "D_SMALL_BUSINESS_CASHFLOW_CRISIS",
+    "E_GAMBLING_PATTERN",
+    "F_MEDICAL_EMERGENCY",
+    "G_INTERNATIONAL_SPENDING_SPIKE",
+    "H_RECOVERY_PATTERN",
+    "I_PENSIONER_MEDICAL_DRAIN",
+    "J_STUDENT_SEMESTER_CRUNCH",
 ]
 
-faker = Faker("en_IN")
 
-
-def _merchant_category_for_event_type(event_type: str) -> str:
-    return {
-        "PAYMENT": "Utilities",
-        "MISSED_PAYMENT": "Cash Advance",
-        "PARTIAL_PAYMENT": "Online Shopping",
-        "LOAN_INQUIRY": "Travel",
-        "CREDIT_UTILIZATION_UPDATE": "Electronics",
-        "INCOME_CREDIT": "Salary",
-        "PENALTY_APPLIED": "Penalty",
-        "LOAN_OPENED": "Finance",
-        "LOAN_CLOSED": "Finance",
-        "ADDRESS_CHANGE": "Unknown",
-        "SETTLEMENT_OFFER": "Settlement",
-        "LEGAL_NOTICE_SENT": "Legal",
-    }.get(event_type, "Unknown")
+MERCHANT_POOLS: dict[str, list[str]] = {
+    "food_delivery": ["zomato", "swiggy", "zepto", "blinkit"],
+    "transport": ["ola", "uber", "rapido", "irctc", "redbus", "indigo_airlines"],
+    "grocery": ["dmart", "bigbasket", "reliance_fresh", "more_supermarket"],
+    "fuel": ["hp_petrol_pump", "indian_oil", "bpcl_pump"],
+    "utilities": ["mseb_electricity", "bescom", "tata_power", "jio_recharge", "airtel_bill"],
+    "entertainment": ["netflix", "hotstar", "pvr_cinemas", "bookmyshow", "sony_liv"],
+    "healthcare": ["apollo_pharmacy", "medplus", "fortis_hospital", "practo"],
+    "education": ["byju", "unacademy", "college_fee", "school_fee"],
+    "ecommerce": ["amazon_india", "flipkart", "meesho", "myntra"],
+    "finance": ["mutual_fund_sip", "insurance_premium", "loan_emi"],
+    "luxury": ["taj_hotels", "louis_vuitton", "apple_store", "forex_usd"],
+    "rural_kirana": ["kirana_store", "agri_supply_store", "fertilizer_seed_store"],
+    "gaming": ["online_gaming", "teen_patti", "rummy_circle"],
+    "business": ["vendor_neft", "logistics_partner", "petrol_fleet"],
+}
 
 
 @dataclass
-class PersonaState:
+class IndianBankingPersona:
     customer_id: str
-    loan_id: str
-    loan_type: str
-    employment_type: str
-    region: str
     archetype: str
     monthly_income: float
-    debt_to_income: float
-    credit_utilization: float
-    outstanding_balance: float
-    account_balance: float
-    days_past_due: int
-    payment_streak: int
-    missed_payment_count: int
-    account_age_months: int
-    num_active_loans: int
-    risk_score_prev: float
+    loan_amount: float
+    loan_type: str
+    occupation: str
+    branch: str
+    overdraft_limit: float
+    current_balance: float
     simulated_time: datetime
-    months_on_book: int = 0
-    # BUG-05 fix: track last simulated month to count calendar-month crossings
-    sim_month_cursor: int = 0
-    # BUG-15: track drift baseline to cap accumulation
-    drift_applied_cycles: int = 0
+    last_salary_date: datetime | None = None
+    last_emi_date: datetime | None = None
+    last_pension_date: datetime | None = None
+    last_payment_date: datetime | None = None
+    last_atm_date: datetime | None = None
+    scenario: str | None = None
+    scenario_step: int = 0
+    scenario_until: datetime | None = None
+    health_shock_multiplier: float = 1.0
+    decline_events: deque = field(default_factory=lambda: deque(maxlen=64))
+
+    def register_decline(self, now_ist: datetime) -> None:
+        self.decline_events.append(now_ist)
+
+    def previous_declines_24h(self, now_ist: datetime) -> int:
+        cutoff = now_ist - timedelta(hours=24)
+        while self.decline_events and self.decline_events[0] < cutoff:
+            self.decline_events.popleft()
+        return len(self.decline_events)
 
 
-@dataclass
-class ScenarioAssertion:
-    scenario_id: str
-    customer_id: str
-    expected_tier: str
-    actual_tier: str
-    cycles_to_converge: int
-    passed: bool
-    timestamp: str
+class RealismEngine:
+    def __init__(self, rng: random.Random):
+        self.rng = rng
+
+    @staticmethod
+    def now_ist() -> datetime:
+        return datetime.now(IST)
+
+    def advance_persona_time(self, persona: IndianBankingPersona) -> datetime:
+        # Keep a fast-forward simulation clock to express monthly/seasonal patterns
+        # while still emitting in real time.
+        increment_minutes = self.rng.randint(45, 240)
+        persona.simulated_time = persona.simulated_time + timedelta(minutes=increment_minutes)
+        return persona.simulated_time
+
+    @staticmethod
+    def is_weekend(ts: datetime) -> bool:
+        return ts.weekday() >= 5
+
+    @staticmethod
+    def is_festival_window(ts: datetime) -> bool:
+        # Holi ~Mar, Diwali ~Oct-Nov seasonal bump.
+        return ts.month in {3, 10, 11}
+
+    @staticmethod
+    def is_kharif(ts: datetime) -> bool:
+        return ts.month in {6, 7, 8, 9, 10}
+
+    @staticmethod
+    def is_rabi(ts: datetime) -> bool:
+        return ts.month in {11, 12, 1, 2, 3}
+
+    @staticmethod
+    def set_time(ts: datetime, hour: int, minute: int) -> datetime:
+        return ts.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+    def pick_upi_hour(self) -> int:
+        roll = self.rng.random()
+        if roll < 0.38:
+            return self.rng.randint(12, 14)
+        if roll < 0.76:
+            return self.rng.randint(19, 22)
+        return self.rng.randint(7, 23)
+
+    def clamp_balance(self, persona: IndianBankingPersona, proposed: float) -> float:
+        min_balance = -persona.overdraft_limit
+        return round(max(min_balance, proposed), 2)
+
+    def event_hour(self, event_type: str, base: datetime) -> datetime:
+        if event_type == "SALARY_CREDIT":
+            return self.set_time(base, self.rng.randint(9, 11), self.rng.randint(0, 55))
+        if event_type == "PENSION_CREDIT":
+            return self.set_time(base, self.rng.randint(9, 11), self.rng.randint(0, 55))
+        if event_type == "EMI_DEBIT":
+            return self.set_time(base, 6, self.rng.randint(0, 20))
+        if event_type == "ATM_WITHDRAWAL":
+            return self.set_time(base, self.rng.randint(10, 20), self.rng.randint(0, 55))
+        if event_type == "CHEQUE_BOUNCE":
+            return self.set_time(base, self.rng.randint(9, 10), self.rng.randint(30, 59))
+        if event_type == "BILL_PAYMENT":
+            return self.set_time(base, self.rng.randint(8, 23), self.rng.randint(0, 55))
+        if event_type == "UPI_DEBIT" or event_type == "UPI_CREDIT":
+            return self.set_time(base, self.pick_upi_hour(), self.rng.randint(0, 59))
+        return self.set_time(base, self.rng.randint(7, 22), self.rng.randint(0, 59))
 
 
-@dataclass
-class ScenarioRuntime:
-    scenario_id: str
-    customer_id: str
-    expected_tier: str
-    remaining_cycles: int
-    tolerance_cycles: int = 2
-    seen_cycles: int = 0
+class TransactionGenerator:
+    def __init__(self, rng: random.Random, realism: RealismEngine):
+        self.rng = rng
+        self.realism = realism
 
+    def _pick(self, pool_key: str) -> str:
+        return self.rng.choice(MERCHANT_POOLS[pool_key])
 
-class AdvancedRedisStreamProducer:
-    def __init__(self) -> None:
-        self.stream_rate_per_second = max(1, int(os.getenv("STREAM_RATE_PER_SECOND", "10")))
-        self.stream_burst = os.getenv("STREAM_BURST", "false").strip().lower() in {"1", "true", "yes", "on"}
-        self.scenario_interval_minutes = max(1, int(os.getenv("SCENARIO_INTERVAL_MINUTES", "15")))
-        self.simulate_time = os.getenv("SIMULATE_TIME", "true").strip().lower() in {"1", "true", "yes", "on"}
-        self.stream_seed = int(os.getenv("STREAM_SEED", "42"))
-        self.inject_drift = os.getenv("INJECT_DRIFT", "false").strip().lower() in {"1", "true", "yes", "on"}
-        self.max_stream_len = int(os.getenv("STREAM_MAXLEN", "100000"))
+    def _inr(self, low: float, high: float) -> float:
+        """Generate a unique INR amount with time-based entropy to avoid repeats."""
+        # Inject entropy from current timestamp nanoseconds + random jitter
+        entropy = (time.time() * 1000000) % 1.0
+        jitter = self.rng.gauss(0, (high - low) * 0.08)  # 8% std-dev jitter
+        base = self.rng.uniform(low, high)
+        amount = base + jitter + (entropy * (high - low) * 0.05)
+        return round(max(low * 0.85, min(high * 1.15, amount)), 2)
 
-        # MISSING-04 fix: configurable time advance; default 72h compresses 12 months into ~10 real minutes
-        # (50 customers × 1 event/5 s → 120 events/customer in 10 min → 365 days/120 ≈ 73 h/event)
-        self._time_advance_hours = float(os.getenv("SIMULATE_TIME_ADVANCE_HOURS", "72"))
+    def _is_due(self, last_date: datetime | None, ts: datetime, *, day: int) -> bool:
+        if ts.day != day:
+            return False
+        if last_date is None:
+            return True
+        return last_date.month != ts.month or last_date.year != ts.year
 
-        # Per-customer streaming interval
-        self.stream_interval_min = max(0.5, float(os.getenv("TRANSACTION_STREAM_MIN_SECONDS", "5")))
-        self.stream_interval_max = max(self.stream_interval_min, float(os.getenv("TRANSACTION_STREAM_MAX_SECONDS", "10")))
-        self.per_customer_mode = os.getenv("PER_CUSTOMER_STREAMING", "true").strip().lower() in {"1", "true", "yes", "on"}
+    def _is_due_any(self, last_date: datetime | None, ts: datetime, *, days: set[int]) -> bool:
+        if ts.day not in days:
+            return False
+        if last_date is None:
+            return True
+        return last_date.month != ts.month or last_date.year != ts.year or last_date.day != ts.day
 
-        # Portfolio-level mix controller for realistic stream distribution.
-        # Default keeps only a minority of events in severe tiers.
-        self.enforce_tier_mix = os.getenv("ENFORCE_STREAM_TIER_MIX", "true").strip().lower() in {"1", "true", "yes", "on"}
-        self.tier_mix_window = max(50, int(os.getenv("STREAM_TIER_MIX_WINDOW", "400")))
-        self.tier_mix_targets: dict[str, float] = {
-            "VERY_CRITICAL": 0.10,
-            "CRITICAL": 0.10,
-            "HIGH_RISK": 0.20,
-            "LOW_RISK": 0.60,
+    def _student_fee_due(self, persona: IndianBankingPersona, ts: datetime) -> bool:
+        # Semester fee event around Jan/Jul once.
+        if ts.month not in {1, 7}:
+            return False
+        if ts.day not in {4, 5, 6, 7, 8, 9, 10}:
+            return False
+        return persona.last_payment_date is None or persona.last_payment_date.month != ts.month
+
+    def _inject_or_progress_scenario(self, persona: IndianBankingPersona, ts: datetime) -> None:
+        if persona.scenario and persona.scenario_until and ts >= persona.scenario_until:
+            persona.scenario = None
+            persona.scenario_step = 0
+        if persona.scenario is None and self.rng.random() < 0.015:
+            persona.scenario = self.rng.choice(SCENARIO_CODES)
+            persona.scenario_step = 0
+            persona.scenario_until = ts + timedelta(days=self.rng.randint(3, 14))
+
+    def _scenario_event(self, persona: IndianBankingPersona, ts: datetime) -> dict | None:
+        s = persona.scenario
+        if not s:
+            return None
+
+        step = persona.scenario_step
+
+        if s == "A_SALARY_DELAY_STRESS":
+            # Spend continues without salary, then bounce.
+            if step < 3:
+                persona.scenario_step += 1
+                return {
+                    "event_type": "UPI_DEBIT",
+                    "merchant_category": self._pick("food_delivery"),
+                    "amount": self._inr(350, 2800),
+                    "is_international": False,
+                }
+            persona.scenario_step += 1
+            return {
+                "event_type": "CHEQUE_BOUNCE",
+                "merchant_category": "loan_emi",
+                "amount": 500.0,
+                "is_international": False,
+                "decline": True,
+            }
+
+        if s == "B_EMI_STACK_STRESS":
+            if step < 3:
+                persona.scenario_step += 1
+                return {
+                    "event_type": "EMI_DEBIT",
+                    "merchant_category": "loan_emi",
+                    "amount": self._inr(7000, 36000),
+                    "is_international": False,
+                }
+            persona.scenario_step += 1
+            return {
+                "event_type": "ATM_WITHDRAWAL",
+                "merchant_category": "atm_cash",
+                "amount": self._inr(800, 3500),
+                "is_international": False,
+            }
+
+        if s == "C_INCOME_STABILITY":
+            persona.scenario_step += 1
+            if self.rng.random() < 0.45:
+                return {
+                    "event_type": "BILL_PAYMENT",
+                    "merchant_category": self._pick("utilities"),
+                    "amount": self._inr(700, 3200),
+                    "is_international": False,
+                }
+            return {
+                "event_type": "UPI_DEBIT",
+                "merchant_category": self._pick("grocery"),
+                "amount": self._inr(200, 1800),
+                "is_international": False,
+            }
+
+        if s == "D_SMALL_BUSINESS_CASHFLOW_CRISIS":
+            persona.scenario_step += 1
+            if step < 3:
+                return {
+                    "event_type": "NEFT_TRANSFER_OUT",
+                    "merchant_category": "vendor_neft",
+                    "amount": self._inr(12000, 90000),
+                    "is_international": False,
+                }
+            return {
+                "event_type": "CHEQUE_BOUNCE",
+                "merchant_category": "gst_payment_bounce",
+                "amount": 500.0,
+                "is_international": False,
+                "decline": True,
+            }
+
+        if s == "E_GAMBLING_PATTERN":
+            persona.scenario_step += 1
+            forced_ts = self.realism.set_time(ts, self.rng.randint(23, 23), self.rng.randint(0, 59))
+            persona.simulated_time = forced_ts
+            if step % 4 == 3:
+                return {
+                    "event_type": "UPI_CREDIT",
+                    "merchant_category": "family_topup",
+                    "amount": self._inr(500, 3000),
+                    "is_international": False,
+                }
+            return {
+                "event_type": "UPI_DEBIT",
+                "merchant_category": self._pick("gaming"),
+                "amount": self._inr(1200, 8500),
+                "is_international": False,
+            }
+
+        if s == "F_MEDICAL_EMERGENCY":
+            persona.scenario_step += 1
+            if step == 0:
+                return {
+                    "event_type": "MERCHANT_PURCHASE",
+                    "merchant_category": "fortis_hospital",
+                    "amount": self._inr(50000, 200000),
+                    "is_international": False,
+                }
+            return {
+                "event_type": "UPI_DEBIT",
+                "merchant_category": self._pick("healthcare"),
+                "amount": self._inr(600, 6500) * persona.health_shock_multiplier,
+                "is_international": False,
+            }
+
+        if s == "G_INTERNATIONAL_SPENDING_SPIKE":
+            persona.scenario_step += 1
+            return {
+                "event_type": "INTERNATIONAL_DEBIT",
+                "merchant_category": "forex_usd",
+                "amount": self._inr(10000, 180000),
+                "is_international": True,
+            }
+
+        if s == "H_RECOVERY_PATTERN":
+            persona.scenario_step += 1
+            if step == 0:
+                return {
+                    "event_type": "LOAN_DISBURSEMENT_CREDIT",
+                    "merchant_category": "loan_disbursement",
+                    "amount": self._inr(90000, 450000),
+                    "is_international": False,
+                }
+            return {
+                "event_type": "EMI_DEBIT",
+                "merchant_category": "loan_emi",
+                "amount": self._inr(6000, 28000),
+                "is_international": False,
+            }
+
+        if s == "I_PENSIONER_MEDICAL_DRAIN":
+            persona.scenario_step += 1
+            persona.health_shock_multiplier = min(3.0, persona.health_shock_multiplier + 0.12)
+            return {
+                "event_type": "UPI_DEBIT",
+                "merchant_category": self._pick("healthcare"),
+                "amount": self._inr(900, 5500) * persona.health_shock_multiplier,
+                "is_international": False,
+            }
+
+        if s == "J_STUDENT_SEMESTER_CRUNCH":
+            persona.scenario_step += 1
+            if step == 0:
+                return {
+                    "event_type": "MERCHANT_PURCHASE",
+                    "merchant_category": "college_fee",
+                    "amount": self._inr(45000, 130000),
+                    "is_international": False,
+                }
+            return {
+                "event_type": "UPI_DEBIT",
+                "merchant_category": self._pick("food_delivery"),
+                "amount": self._inr(70, 350),
+                "is_international": False,
+            }
+
+        return None
+
+    def _salaried_urban(self, persona: IndianBankingPersona, ts: datetime) -> dict:
+        if self._is_due_any(persona.last_salary_date, ts, days={1, 5}):
+            return {
+                "event_type": "SALARY_CREDIT",
+                "merchant_category": "salary_credit",
+                "amount": self._inr(25000, 120000),
+                "is_international": False,
+            }
+        if self._is_due(persona.last_emi_date, ts, day=3):
+            return {
+                "event_type": "EMI_DEBIT",
+                "merchant_category": "loan_emi",
+                "amount": self._inr(5000, 40000),
+                "is_international": False,
+            }
+        if persona.last_atm_date is None or (ts.date() - persona.last_atm_date.date()).days >= 7:
+            return {
+                "event_type": "ATM_WITHDRAWAL",
+                "merchant_category": "atm_cash",
+                "amount": self._inr(2000, 10000),
+                "is_international": False,
+            }
+
+        if self.realism.is_weekend(ts):
+            amount = self._inr(250, 2800) * 1.4
+            merchant = self._pick("entertainment") if self.rng.random() < 0.45 else self._pick("food_delivery")
+        else:
+            amount = self._inr(120, 2200)
+            merchant = self._pick("food_delivery") if self.rng.random() < 0.45 else self._pick("transport")
+
+        if self.rng.random() < 0.12:
+            merchant = self._pick("grocery")
+            amount = self._inr(700, 4200)
+        if self.rng.random() < 0.08:
+            merchant = self._pick("fuel")
+            amount = self._inr(2000, 5000)
+
+        return {
+            "event_type": "UPI_DEBIT",
+            "merchant_category": merchant,
+            "amount": amount,
+            "is_international": False,
         }
 
-        self.random = random.Random(self.stream_seed)
-        self.stop_event = threading.Event()
-        self.pause_event = threading.Event()
+    def _salaried_rural(self, persona: IndianBankingPersona, ts: datetime) -> dict:
+        if self._is_due_any(persona.last_salary_date, ts, days={1, 5}):
+            return {
+                "event_type": "SALARY_CREDIT",
+                "merchant_category": "salary_credit",
+                "amount": self._inr(8000, 25000),
+                "is_international": False,
+            }
+        if self.rng.random() < 0.25:
+            return {
+                "event_type": "ATM_WITHDRAWAL",
+                "merchant_category": "atm_cash",
+                "amount": self._inr(900, 6500),
+                "is_international": False,
+            }
+        if ts.day in {6, 7, 8, 9, 10} and self.rng.random() < 0.12:
+            return {
+                "event_type": "BILL_PAYMENT",
+                "merchant_category": "jio_recharge",
+                "amount": self._inr(200, 600),
+                "is_international": False,
+            }
+        if self.realism.is_kharif(ts) or self.realism.is_rabi(ts):
+            if self.rng.random() < 0.18:
+                return {
+                    "event_type": "NEFT_TRANSFER_OUT",
+                    "merchant_category": "fertilizer_seed_store",
+                    "amount": self._inr(1200, 12000),
+                    "is_international": False,
+                }
+        return {
+            "event_type": "UPI_DEBIT",
+            "merchant_category": "kirana_store",
+            "amount": self._inr(50, 500),
+            "is_international": False,
+        }
 
-        self.personas: list[PersonaState] = self._build_persona_pool_from_db()
+    def _self_employed_business(self, persona: IndianBankingPersona, ts: datetime) -> dict:
+        if ts.day == 20 and self.rng.random() < 0.5:
+            return {
+                "event_type": "GST_PAYMENT",
+                "merchant_category": "gst_portal",
+                "amount": self._inr(15000, 180000),
+                "is_international": False,
+            }
+        if self.rng.random() < 0.22:
+            return {
+                "event_type": "NEFT_TRANSFER_IN",
+                "merchant_category": "business_receipt",
+                "amount": self._inr(50000, 500000),
+                "is_international": False,
+            }
+        if self.rng.random() < 0.46:
+            return {
+                "event_type": "NEFT_TRANSFER_OUT",
+                "merchant_category": "vendor_neft",
+                "amount": self._inr(15000, 175000),
+                "is_international": False,
+            }
+        if self.rng.random() < 0.18:
+            return {
+                "event_type": "IMPS_DEBIT",
+                "merchant_category": "logistics_partner",
+                "amount": self._inr(5000, 45000),
+                "is_international": False,
+            }
+        return {
+            "event_type": "ATM_WITHDRAWAL",
+            "merchant_category": "atm_cash",
+            "amount": self._inr(1000, 12000),
+            "is_international": False,
+        }
 
-        self.scenario_index = 0
-        self.next_scenario_due = get_ist_now() + timedelta(minutes=self.scenario_interval_minutes)
-        self.active_scenario: ScenarioRuntime | None = None
+    def _daily_wage_worker(self, persona: IndianBankingPersona, ts: datetime) -> dict:
+        if self.rng.random() < 0.52:
+            return {
+                "event_type": "UPI_CREDIT",
+                "merchant_category": "daily_wage_credit",
+                "amount": self._inr(300, 800),
+                "is_international": False,
+            }
+        if self.rng.random() < 0.18:
+            return {
+                "event_type": "BILL_PAYMENT",
+                "merchant_category": "jio_recharge",
+                "amount": self._inr(99, 299),
+                "is_international": False,
+            }
+        return {
+            "event_type": "UPI_DEBIT",
+            "merchant_category": "kirana_store",
+            "amount": self._inr(50, 450),
+            "is_international": False,
+        }
 
-        self.last_event_times: dict[str, float] = {}
-        self.intervention_targets: dict[str, int] = {}
-        self.transactions_since_trigger: dict[str, int] = {}
+    def _retired_pensioner(self, persona: IndianBankingPersona, ts: datetime) -> dict:
+        if self._is_due(persona.last_pension_date, ts, day=1):
+            return {
+                "event_type": "PENSION_CREDIT",
+                "merchant_category": "pension_credit",
+                "amount": self._inr(15000, 45000),
+                "is_international": False,
+            }
+        if ts.month in {1, 4, 7, 10} and ts.day in {1, 2, 3} and self.rng.random() < 0.45:
+            return {
+                "event_type": "FD_INTEREST_CREDIT",
+                "merchant_category": "fd_interest",
+                "amount": self._inr(1500, 12000),
+                "is_international": False,
+            }
+        if ts.day <= 7 and self.rng.random() < 0.4:
+            return {
+                "event_type": "BILL_PAYMENT",
+                "merchant_category": self._pick("utilities"),
+                "amount": self._inr(700, 3800),
+                "is_international": False,
+            }
+        return {
+            "event_type": "UPI_DEBIT",
+            "merchant_category": self._pick("healthcare"),
+            "amount": self._inr(250, 6500),
+            "is_international": False,
+        }
 
-        self.recent_archetypes: deque[str] = deque(maxlen=100)
-        self.recent_tiers: deque[str] = deque(maxlen=self.tier_mix_window)
-        self.assertions: deque[ScenarioAssertion] = deque(maxlen=1000)
-        self.events_in_window = 0
-        self.last_metrics_at = time.time()
+    def _student(self, persona: IndianBankingPersona, ts: datetime) -> dict:
+        if self._is_due_any(persona.last_salary_date, ts, days={1, 2}):
+            return {
+                "event_type": "UPI_CREDIT",
+                "merchant_category": "parent_transfer",
+                "amount": self._inr(5000, 15000),
+                "is_international": False,
+            }
+        if self._student_fee_due(persona, ts):
+            return {
+                "event_type": "MERCHANT_PURCHASE",
+                "merchant_category": "college_fee",
+                "amount": self._inr(35000, 110000),
+                "is_international": False,
+            }
+        if self.rng.random() < 0.5:
+            merchant = self._pick("food_delivery")
+            amount = self._inr(90, 700)
+        elif self.rng.random() < 0.8:
+            merchant = self._pick("entertainment")
+            amount = self._inr(120, 1400)
+        else:
+            merchant = self._pick("gaming")
+            amount = self._inr(150, 2500)
+        return {
+            "event_type": "UPI_DEBIT",
+            "merchant_category": merchant,
+            "amount": amount,
+            "is_international": False,
+        }
+
+    def _high_net_worth(self, persona: IndianBankingPersona, ts: datetime) -> dict:
+        if self.rng.random() < 0.18:
+            return {
+                "event_type": "RTGS_CREDIT",
+                "merchant_category": "wealth_transfer",
+                "amount": self._inr(500000, 5000000),
+                "is_international": False,
+            }
+        if ts.day == 10 and self.rng.random() < 0.45:
+            return {
+                "event_type": "SIP_DEBIT",
+                "merchant_category": "mutual_fund_sip",
+                "amount": self._inr(15000, 250000),
+                "is_international": False,
+            }
+        if self.rng.random() < 0.25:
+            return {
+                "event_type": "INTERNATIONAL_DEBIT",
+                "merchant_category": "forex_usd",
+                "amount": self._inr(25000, 600000),
+                "is_international": True,
+            }
+        if self.rng.random() < 0.35:
+            return {
+                "event_type": "EMI_DEBIT",
+                "merchant_category": "loan_emi",
+                "amount": self._inr(25000, 300000),
+                "is_international": False,
+            }
+        return {
+            "event_type": "MERCHANT_PURCHASE",
+            "merchant_category": self._pick("luxury"),
+            "amount": self._inr(8000, 350000),
+            "is_international": self.rng.random() < 0.2,
+        }
+
+    def _base_event_for_archetype(self, persona: IndianBankingPersona, ts: datetime) -> dict:
+        if persona.archetype == "SALARIED_URBAN":
+            return self._salaried_urban(persona, ts)
+        if persona.archetype == "SALARIED_RURAL":
+            return self._salaried_rural(persona, ts)
+        if persona.archetype == "SELF_EMPLOYED_BUSINESS":
+            return self._self_employed_business(persona, ts)
+        if persona.archetype == "DAILY_WAGE_WORKER":
+            return self._daily_wage_worker(persona, ts)
+        if persona.archetype == "RETIRED_PENSIONER":
+            return self._retired_pensioner(persona, ts)
+        if persona.archetype == "STUDENT":
+            return self._student(persona, ts)
+        return self._high_net_worth(persona, ts)
 
     # ------------------------------------------------------------------
-    # Persona pool construction
+    # Spending culture modifiers — scale amounts so that customers with
+    # "Essentials First" culture transact within modest, everyday ranges
+    # rather than generating amounts that look anomalous to risk models.
     # ------------------------------------------------------------------
+    _SPENDING_CULTURE_MODIFIERS = {
+        "Essentials First": {"scale": 0.55, "max_cap_income_pct": 0.12, "debit_bias": 0.85},
+        "Balanced":         {"scale": 0.80, "max_cap_income_pct": 0.25, "debit_bias": 0.70},
+        "Lifestyle Heavy":  {"scale": 1.20, "max_cap_income_pct": 0.45, "debit_bias": 0.60},
+        "Volatile":         {"scale": 1.45, "max_cap_income_pct": 0.65, "debit_bias": 0.50},
+    }
 
-    def _build_persona_pool(self, size: int) -> list[PersonaState]:
-        archetypes: list[str] = []
-        for name, weight in ARCHETYPE_WEIGHTS.items():
-            archetypes.extend([name] * int(round(size * weight)))
-        while len(archetypes) < size:
-            archetypes.append("STABLE_GOOD")
-        archetypes = archetypes[:size]
-        self.random.shuffle(archetypes)
+    def _apply_spending_culture(self, persona: IndianBankingPersona, tx: dict) -> dict:
+        """Scale transaction amount based on the customer's spending culture.
 
-        loan_types = ["HOME", "PERSONAL", "AUTO", "EDUCATION", "BUSINESS"]
-        employment_types = ["SALARIED", "SELF_EMPLOYED", "BUSINESS", "RETIRED"]
-        regions = ["METRO", "TIER_1", "TIER_2", "RURAL"]
-
-        personas: list[PersonaState] = []
-        now = get_ist_now()
-        for idx in range(size):
-            customer_uuid = str(uuid.uuid4())
-            loan_pan = f"{faker.random_uppercase_letter()}{faker.random_uppercase_letter()}{faker.random_uppercase_letter()}PA{faker.random_uppercase_letter()}{faker.random_uppercase_letter()}{idx % 10}"
-            loan_id = f"{loan_pan}-{100000 + idx}"
-            monthly_income = float(self.random.randint(25000, 300000))
-            dti = self.random.uniform(0.2, 0.55)
-            outstanding = monthly_income * self.random.uniform(4.0, 12.0)
-            account_balance = monthly_income * self.random.uniform(1.3, 4.8)
-            sim_start = now - timedelta(days=self.random.randint(20, 240))
-            personas.append(
-                PersonaState(
-                    customer_id=customer_uuid,
-                    loan_id=loan_id,
-                    loan_type=self.random.choice(loan_types),
-                    employment_type=self.random.choice(employment_types),
-                    region=self.random.choice(regions),
-                    archetype=archetypes[idx],
-                    monthly_income=monthly_income,
-                    debt_to_income=dti,
-                    credit_utilization=self.random.uniform(0.2, 0.6),
-                    outstanding_balance=outstanding,
-                    account_balance=account_balance,
-                    days_past_due=0,
-                    payment_streak=self.random.randint(2, 16),
-                    missed_payment_count=0,
-                    account_age_months=self.random.randint(6, 180),
-                    num_active_loans=self.random.randint(1, 4),
-                    risk_score_prev=self.random.uniform(18.0, 52.0),
-                    simulated_time=sim_start,
-                    sim_month_cursor=sim_start.year * 12 + sim_start.month,
-                )
-            )
-        return personas
-
-    def _build_persona_pool_from_db(self) -> list[PersonaState]:
-        """Load customer profiles from database and create personas."""
+        This prevents 'Essentials First' customers from generating large
+        discretionary spends that push them into critical risk bands.
+        """
+        # Look up spending culture from DB-seeded profile
+        culture = None
         try:
-            db = SessionLocal()
-            profiles = db.query(CustomerProfile).order_by(CustomerProfile.customer_id.asc()).all()
-            db.close()
+            from backend.cache import get_customer_profile
+            profile = get_customer_profile(persona.customer_id)
+            if profile:
+                culture = profile.get("spending_culture")
+        except Exception:
+            pass
 
-            if not profiles:
-                print("[STREAM] WARNING: No customer profiles found in database, using fallback")
-                return self._build_persona_pool(size=50)
+        if not culture or culture not in self._SPENDING_CULTURE_MODIFIERS:
+            return tx  # no modification
 
-            personas: list[PersonaState] = []
-            now = get_ist_now()
-            employment_types = ["SALARIED", "SELF_EMPLOYED", "BUSINESS", "RETIRED"]
-            regions = ["METRO", "TIER_1", "TIER_2", "RURAL"]
+        mods = self._SPENDING_CULTURE_MODIFIERS[culture]
+        event_type = str(tx.get("event_type", "")).upper()
 
-            archetype_mapping = {
-                "PRE_DELINQUENT": "GHOST_PAYER",
-                "DELINQUENT": "SLOW_BLEEDER",
-                "RECOVERING": "RECOVERER",
-                "PERFORMING": "STABLE_GOOD",
-                "AT_RISK": "SEASONAL_DEFAULTER",
-                "CRITICAL": "CASCADING_DEFAULTER",
-            }
+        # Don't modify credit events (salary, pension, etc.) or EMI debits
+        if event_type in CREDIT_EVENTS or event_type in {"EMI_DEBIT", "INSURANCE_PREMIUM", "SIP_DEBIT"}:
+            return tx
 
-            # Keep base personas diverse: healthy archetypes should not start with
-            # stressed DTI/utilization, while risky archetypes start closer to stress.
-            dti_bands = {
-                "STABLE_GOOD": (0.12, 0.28),
-                "RECOVERER": (0.18, 0.38),
-                "FALSE_ALARM": (0.28, 0.46),
-                "NEAR_MISS": (0.30, 0.50),
-                "GHOST_PAYER": (0.32, 0.56),
-                "SLOW_BLEEDER": (0.42, 0.68),
-                "SEASONAL_DEFAULTER": (0.38, 0.64),
-                "CASCADING_DEFAULTER": (0.55, 0.82),
-                "SYNTHETIC_FRAUD_SIGNAL": (0.36, 0.66),
-            }
-            util_bands = {
-                "STABLE_GOOD": (0.08, 0.32),
-                "RECOVERER": (0.14, 0.42),
-                "FALSE_ALARM": (0.40, 0.68),
-                "NEAR_MISS": (0.34, 0.62),
-                "GHOST_PAYER": (0.30, 0.60),
-                "SLOW_BLEEDER": (0.48, 0.78),
-                "SEASONAL_DEFAULTER": (0.44, 0.76),
-                "CASCADING_DEFAULTER": (0.62, 0.90),
-                "SYNTHETIC_FRAUD_SIGNAL": (0.50, 0.84),
-            }
+        amount = float(tx.get("amount", 0))
+        scaled = amount * mods["scale"]
 
-            for profile in profiles:
-                archetype = archetype_mapping.get(profile.risk_segment, "STABLE_GOOD")
-                sim_start = now - timedelta(days=self.random.randint(20, 240))
-                income = float(profile.monthly_income or 50000)
-                loan_amount = float(profile.loan_amount or 0)
-                account_balance = income * self.random.uniform(1.2, 4.5)
+        # Cap at a percentage of monthly income for non-credit events
+        income_cap = persona.monthly_income * mods["max_cap_income_pct"]
+        if income_cap > 0 and scaled > income_cap:
+            scaled = income_cap * self.rng.uniform(0.6, 1.0)
 
-                # Convert principal to a rough monthly burden proxy instead of
-                # principal/income, which unrealistically saturates DTI.
-                monthly_obligation = loan_amount * self.random.uniform(0.015, 0.035)
-                principal_based_dti = monthly_obligation / max(income, 1.0)
-                dti_min, dti_max = dti_bands.get(archetype, (0.18, 0.42))
-                debt_to_income = max(dti_min, min(dti_max, principal_based_dti))
+        tx["amount"] = round(max(50.0, scaled), 2)
+        return tx
 
-                util_min, util_max = util_bands.get(archetype, (0.18, 0.52))
-                credit_utilization = self.random.uniform(util_min, util_max)
-                persona = PersonaState(
-                    customer_id=profile.customer_id,
-                    loan_id=f"LOAN-{profile.customer_id}",
-                    loan_type=profile.loan_type or "PERSONAL",
-                    employment_type=self.random.choice(employment_types),
-                    region=self.random.choice(regions),
-                    archetype=archetype,
-                    monthly_income=income,
-                    debt_to_income=debt_to_income,
-                    credit_utilization=credit_utilization,
-                    outstanding_balance=loan_amount,
-                    account_balance=account_balance,
-                    days_past_due=0,
-                    payment_streak=self.random.randint(2, 16),
-                    missed_payment_count=0,
-                    account_age_months=profile.account_age_months or 12,
-                    num_active_loans=self.random.randint(1, 4),
-                    risk_score_prev=self.random.uniform(18.0, 52.0),
-                    simulated_time=sim_start,
-                    sim_month_cursor=sim_start.year * 12 + sim_start.month,
-                )
-                personas.append(persona)
+    def generate_next(self, persona: IndianBankingPersona) -> dict:
+        ts = self.realism.advance_persona_time(persona)
+        self._inject_or_progress_scenario(persona, ts)
 
-            print(f"[STREAM] Loaded {len(personas)} customer profiles from database for streaming")
-            return personas
-        except Exception as e:
-            print(f"[STREAM] ERROR loading customer profiles: {str(e)}")
-            return self._build_persona_pool(size=50)
+        tx = self._scenario_event(persona, ts)
+        if tx is None:
+            tx = self._base_event_for_archetype(persona, ts)
 
-    # ------------------------------------------------------------------
-    # Time simulation
-    # ------------------------------------------------------------------
+        # Apply spending culture modifiers BEFORE further processing
+        tx = self._apply_spending_culture(persona, tx)
 
-    def _advance_time(self, persona: PersonaState) -> None:
-        if self.simulate_time:
-            # MISSING-04 fix: advance by configured hours per event (default 72h)
-            persona.simulated_time = persona.simulated_time + timedelta(hours=self._time_advance_hours)
+        event_type = str(tx["event_type"]).upper()
+        if event_type not in EVENT_TYPES:
+            event_type = "UPI_DEBIT"
+
+        tx_time = self.realism.event_hour(event_type, ts)
+        amount = round(float(tx["amount"]), 2)
+
+        # Add per-transaction amount jitter to ensure uniqueness
+        jitter_pct = self.rng.gauss(0, 0.03)  # ±3% gaussian jitter
+        time_entropy = ((time.time() * 1e6) % 997) / 997.0 * 0.02  # ±2% time entropy
+        amount = round(amount * (1.0 + jitter_pct + time_entropy), 2)
+        amount = max(10.0, amount)  # floor at ₹10
+
+        is_international = bool(tx.get("is_international", False))
+        merchant = str(tx.get("merchant_category") or "unknown_merchant")
+
+        if self.realism.is_festival_window(tx_time) and event_type in {"UPI_DEBIT", "MERCHANT_PURCHASE"}:
+            amount = round(amount * self.rng.uniform(1.08, 1.30), 2)
+
+        if self.realism.is_weekend(tx_time) and event_type in {"UPI_DEBIT", "MERCHANT_PURCHASE"}:
+            amount = round(amount * self.rng.uniform(1.15, 1.45), 2)
+
+        balance_before = persona.current_balance
+
+        if event_type in CREDIT_EVENTS:
+            balance_after = balance_before + amount
         else:
-            persona.simulated_time = get_ist_now()
+            balance_after = balance_before - amount
 
-    def _update_months_on_book(self, persona: PersonaState) -> None:
-        """BUG-05 fix: count calendar-month crossings in simulated time, not day-of-month."""
-        current_cursor = persona.simulated_time.year * 12 + persona.simulated_time.month
-        if persona.sim_month_cursor == 0:
-            persona.sim_month_cursor = current_cursor
-        elif current_cursor > persona.sim_month_cursor:
-            persona.months_on_book += current_cursor - persona.sim_month_cursor
-            persona.sim_month_cursor = current_cursor
+        if event_type == "CHEQUE_BOUNCE":
+            # Always include bounce charge as required.
+            balance_after = balance_before - (amount + 500.0)
+            amount = amount + 500.0
 
-    # ------------------------------------------------------------------
-    # Calendar-driven event type selection
-    # ------------------------------------------------------------------
+        balance_after = self.realism.clamp_balance(persona, balance_after)
 
-    def _calendar_event_type(self, persona: PersonaState) -> str:
-        day = persona.simulated_time.day
-        if day <= 5:
-            return "INCOME_CREDIT"
-        if day <= 10:
-            return "PAYMENT"
-        if day >= 15 and persona.days_past_due > 0:
-            return "PENALTY_APPLIED"
-        return self.random.choice(["CREDIT_UTILIZATION_UPDATE", "LOAN_INQUIRY", "PARTIAL_PAYMENT", "PAYMENT"])
+        # If capped due to insufficient funds on debit, mark as decline.
+        declined = bool(tx.get("decline", False))
+        if event_type not in CREDIT_EVENTS and balance_before - amount < -persona.overdraft_limit:
+            declined = True
 
-    # ------------------------------------------------------------------
-    # Archetype state machine
-    # ------------------------------------------------------------------
+        if declined:
+            persona.register_decline(tx_time)
 
-    def _apply_archetype_dynamics(self, persona: PersonaState, event_type: str) -> tuple[str, float]:
-        self._update_months_on_book(persona)
-        archetype = persona.archetype
+        persona.current_balance = balance_after
 
-        if archetype == "GHOST_PAYER":
-            # BUG-05 fix: uses months_on_book counted from simulated-calendar crossings
-            if persona.months_on_book >= 4:
-                event_type = "MISSED_PAYMENT"
-                persona.days_past_due = min(180, persona.days_past_due + self.random.randint(18, 35))
-                persona.credit_utilization = min(0.99, persona.credit_utilization + self.random.uniform(0.2, 0.35))
-                persona.payment_streak = 0
-                persona.missed_payment_count += 1
-            else:
-                persona.days_past_due = 0
-                persona.payment_streak += 1
+        if event_type in {"EMI_DEBIT", "BILL_PAYMENT", "NEFT_TRANSFER_OUT", "IMPS_DEBIT"}:
+            persona.last_payment_date = tx_time
+        if event_type == "EMI_DEBIT":
+            persona.last_emi_date = tx_time
+        if event_type in {"SALARY_CREDIT", "UPI_CREDIT", "NEFT_TRANSFER_IN"}:
+            persona.last_salary_date = tx_time
+        if event_type == "PENSION_CREDIT":
+            persona.last_pension_date = tx_time
+        if event_type == "ATM_WITHDRAWAL":
+            persona.last_atm_date = tx_time
 
-        elif archetype == "SLOW_BLEEDER":
-            persona.days_past_due = min(180, int(persona.days_past_due + self.random.choice([0, 1, 2, 3])))
-            persona.monthly_income = max(25000.0, persona.monthly_income * self.random.uniform(0.992, 0.999))
-            persona.debt_to_income = min(0.92, persona.debt_to_income + self.random.uniform(0.002, 0.01))
-            persona.credit_utilization = min(0.98, persona.credit_utilization + self.random.uniform(0.003, 0.012))
-
-        elif archetype == "RECOVERER":
-            persona.days_past_due = max(0, persona.days_past_due - self.random.randint(2, 7))
-            persona.credit_utilization = max(0.15, persona.credit_utilization - self.random.uniform(0.01, 0.05))
-            persona.debt_to_income = max(0.14, persona.debt_to_income - self.random.uniform(0.005, 0.03))
-            event_type = "PAYMENT"
-            persona.payment_streak += 1
-
-        elif archetype == "FALSE_ALARM":
-            persona.days_past_due = 0
-            persona.debt_to_income = min(0.85, max(0.55, persona.debt_to_income + self.random.uniform(-0.01, 0.01)))
-            persona.credit_utilization = min(0.9, max(0.65, persona.credit_utilization + self.random.uniform(-0.02, 0.02)))
-            event_type = "PAYMENT"
-            persona.payment_streak += 1
-
-        elif archetype == "SEASONAL_DEFAULTER":
-            month = persona.simulated_time.month
-            if month in {2, 3, 10, 11}:
-                event_type = "MISSED_PAYMENT"
-                persona.days_past_due = min(180, max(15, persona.days_past_due + self.random.randint(7, 15)))
-                persona.missed_payment_count += 1
-                persona.payment_streak = 0
-            else:
-                event_type = "PAYMENT"
-                persona.days_past_due = max(0, persona.days_past_due - self.random.randint(3, 10))
-                persona.payment_streak += 1
-
-        elif archetype == "CASCADING_DEFAULTER":
-            if persona.days_past_due > 0:
-                persona.days_past_due = min(180, persona.days_past_due + self.random.randint(8, 14))
-                persona.debt_to_income = min(0.96, persona.debt_to_income + self.random.uniform(0.02, 0.05))
-                persona.credit_utilization = min(0.99, persona.credit_utilization + self.random.uniform(0.03, 0.07))
-                event_type = self.random.choice(["MISSED_PAYMENT", "PENALTY_APPLIED"])
-            else:
-                event_type = "MISSED_PAYMENT"
-                persona.days_past_due = self.random.randint(4, 12)
-                persona.missed_payment_count += 1
-                persona.payment_streak = 0
-
-        elif archetype == "SYNTHETIC_FRAUD_SIGNAL":
-            event_type = self.random.choice(["LOAN_OPENED", "ADDRESS_CHANGE", "CREDIT_UTILIZATION_UPDATE"])
-            persona.credit_utilization = min(0.99, persona.credit_utilization + self.random.uniform(0.08, 0.2))
-            persona.num_active_loans = min(6, persona.num_active_loans + self.random.choice([0, 1]))
-            if event_type == "ADDRESS_CHANGE":
-                persona.days_past_due = max(0, persona.days_past_due - 1)
-
-        elif archetype == "STABLE_GOOD":
-            event_type = self.random.choice(["PAYMENT", "INCOME_CREDIT", "CREDIT_UTILIZATION_UPDATE"])
-            persona.days_past_due = 0
-            persona.credit_utilization = min(0.5, max(0.1, persona.credit_utilization + self.random.uniform(-0.015, 0.015)))
-            persona.payment_streak += 1
-
-        elif archetype == "NEAR_MISS":
-            event_type = "PARTIAL_PAYMENT"
-            persona.days_past_due = self.random.randint(1, 3)
-            persona.credit_utilization = min(0.88, max(0.5, persona.credit_utilization + self.random.uniform(-0.01, 0.02)))
-            persona.payment_streak = max(0, persona.payment_streak - 1)
-
-        # --- Amount calculation ---
-        emi_amount = max(5000.0, min(85000.0, persona.monthly_income * self.random.uniform(0.22, 0.38)))
-        penalty = persona.outstanding_balance * self.random.uniform(0.02, 0.03)
-
-        if event_type == "PENALTY_APPLIED":
-            amount = round(penalty, 2)
-            persona.outstanding_balance += amount
-        elif event_type in {"PAYMENT", "PARTIAL_PAYMENT", "SETTLEMENT_OFFER"}:
-            ratio = 1.0 if event_type == "PAYMENT" else (0.6 if event_type == "PARTIAL_PAYMENT" else 0.45)
-            amount = round(emi_amount * ratio, 2)
-            persona.outstanding_balance = max(0.0, persona.outstanding_balance - amount)
-        elif event_type == "INCOME_CREDIT":
-            amount = round(persona.monthly_income * self.random.uniform(0.95, 1.05), 2)
+        if persona.last_payment_date is None:
+            days_since_last_payment = 30
         else:
-            amount = round(emi_amount * self.random.uniform(0.35, 1.6), 2)
-
-        # BUG-15 fix: drift injection is capped so utilization/DTI don't saturate all personas
-        if self.inject_drift:
-            max_drift_cycles = 2000  # cap total drift accumulation
-            if persona.drift_applied_cycles < max_drift_cycles:
-                persona.credit_utilization = min(0.92, persona.credit_utilization + 0.0005)
-                persona.debt_to_income = min(0.85, persona.debt_to_income + 0.00035)
-                persona.drift_applied_cycles += 1
-
-        return event_type, amount
-
-    # ------------------------------------------------------------------
-    # Event builder
-    # ------------------------------------------------------------------
-
-    def _build_event(self, persona: PersonaState, event_type: str, amount: float) -> dict[str, Any]:
-        is_international = event_type in {"LOAN_OPENED", "ADDRESS_CHANGE"}
-
-        prev_balance = float(max(0.0, persona.account_balance))
-        if event_type == "INCOME_CREDIT":
-            next_balance = prev_balance + amount
-        elif event_type in {"PAYMENT", "PARTIAL_PAYMENT", "SETTLEMENT_OFFER", "LOAN_CLOSED"}:
-            next_balance = max(0.0, prev_balance - amount)
-        elif event_type == "LOAN_OPENED":
-            next_balance = prev_balance + amount
-        elif event_type == "CREDIT_UTILIZATION_UPDATE":
-            next_balance = max(0.0, prev_balance - (amount * self.random.uniform(0.65, 1.00)))
-        elif event_type == "MISSED_PAYMENT":
-            fee = max(250.0, amount * self.random.uniform(0.02, 0.08))
-            next_balance = max(0.0, prev_balance - fee)
-        elif event_type in {"PENALTY_APPLIED", "LEGAL_NOTICE_SENT"}:
-            next_balance = max(0.0, prev_balance - amount)
-        else:
-            next_balance = prev_balance
-
-        persona.account_balance = next_balance
+            days_since_last_payment = max(0, (tx_time.date() - persona.last_payment_date.date()).days)
 
         return {
             "customer_id": persona.customer_id,
+            "amount": round(amount, 2),
+            "current_balance": round(balance_after, 2),
+            "days_since_last_payment": int(days_since_last_payment),
+            "previous_declines_24h": int(persona.previous_declines_24h(tx_time)),
+            "merchant_category": merchant,
+            "is_international": bool(is_international),
+            "is_weekend": self.realism.is_weekend(tx_time),
             "event_type": event_type,
-            "timestamp": persona.simulated_time.isoformat(),
-            "amount": round(float(amount), 2),
-            "balance_before": round(float(prev_balance), 2),
-            "loan_id": persona.loan_id,
-            "loan_type": persona.loan_type,
-            "days_past_due": max(0, min(180, int(persona.days_past_due))),
-            "credit_utilization": round(float(max(0.0, min(1.0, persona.credit_utilization))), 4),
-            "debt_to_income": round(float(max(0.1, min(0.9, persona.debt_to_income))), 4),
-            "payment_streak": max(0, int(persona.payment_streak)),
-            "missed_payment_count": max(0, int(persona.missed_payment_count)),
-            "outstanding_balance": round(float(max(0.0, persona.outstanding_balance)), 2),
-            "balance_after": round(float(next_balance), 2),
-            "monthly_income": round(float(persona.monthly_income * self.random.uniform(0.985, 1.015)), 2),
-            "employment_type": persona.employment_type,
-            "account_age_months": max(1, int(persona.account_age_months)),
-            "num_active_loans": max(1, min(6, int(persona.num_active_loans))),
-            "risk_score_prev": round(float(persona.risk_score_prev), 2),
-            "days_since_last_payment": max(0, min(180, int(persona.days_past_due))),
-            "previous_declines_24h": min(6, max(0, int(persona.missed_payment_count))),
-            "is_international": "true" if is_international else "false",
-            "merchant_category": _merchant_category_for_event_type(event_type),
-            "region": persona.region,
+            "transaction_time": tx_time.isoformat(),
             "archetype": persona.archetype,
+            "scenario": persona.scenario,
         }
 
-    def _build_model_features(self, event: dict[str, Any]) -> dict[str, Any]:
-        """
-        BUG-09 fix: pass all rich behavioral fields to the prediction pipeline
-        instead of just the original 6.  calculate_features_from_transaction()
-        in predict.py now consumes credit_utilization, debt_to_income,
-        payment_streak, missed_payment_count, and num_active_loans.
-        """
-        return {
-            # Core transactional fields
-            "amount": event["amount"],
-            "current_balance": event["balance_after"],
-            "days_since_last_payment": event["days_since_last_payment"],
-            "previous_declines_24h": event["previous_declines_24h"],
-            "is_international": event["is_international"],
-            "merchant_category": event["merchant_category"],
-            "event_type": event.get("event_type", ""),
-            # Rich behavioral signals (BUG-09)
-            "credit_utilization": event.get("credit_utilization"),
-            "debt_to_income": event.get("debt_to_income"),
-            "payment_streak": event.get("payment_streak", 0),
-            "missed_payment_count": event.get("missed_payment_count", 0),
-            "num_active_loans": event.get("num_active_loans", 1),
-            "monthly_income": event.get("monthly_income", 0),
+
+class AdvancedRedisStreamProducer:
+    def __init__(self):
+        self.stream_key = os.getenv("REDIS_STREAM_KEY", "pie:transactions")
+        self.stream_min_seconds = max(5.0, float(os.getenv("TRANSACTION_STREAM_MIN_SECONDS", "5")))
+        self.stream_max_seconds = max(self.stream_min_seconds, float(os.getenv("TRANSACTION_STREAM_MAX_SECONDS", "10")))
+        self.stream_seed = int(os.getenv("STREAM_RANDOM_SEED", "42"))
+        self.stream_maxlen = int(os.getenv("STREAM_MAXLEN", "250000"))
+
+        self.stop_event = threading.Event()
+        self.pause_event = threading.Event()
+
+        self.rng = random.Random(self.stream_seed)
+        self.realism = RealismEngine(self.rng)
+        self.generator = TransactionGenerator(self.rng, self.realism)
+
+        self.personas = self._load_personas()
+        self._round_robin_index = 0
+        self.next_due_at: dict[str, float] = {
+            p.customer_id: time.time() + self.rng.uniform(0.2, 2.5) for p in self.personas
         }
 
-    def _pick_target_tier(self) -> str:
-        """Choose the next target tier based on deficits vs configured mix."""
-        if not self.recent_tiers:
-            tiers = list(self.tier_mix_targets.keys())
-            weights = [self.tier_mix_targets[tier] for tier in tiers]
-            return self.random.choices(tiers, weights=weights, k=1)[0]
+        self.started_at = time.time()
+        self.published_count = 0
+        self.event_type_counter: Counter[str] = Counter()
+        self.archetype_counter: Counter[str] = Counter()
+        self.last_publish_at = time.time()
 
-        counts = Counter(self.recent_tiers)
-        next_total = len(self.recent_tiers) + 1
-        deficit_weights: dict[str, float] = {}
+    def _archetype_from_profile(self, profile: CustomerProfile) -> str:
+        occupation = str(profile.occupation or "").lower()
+        branch = str(profile.branch or "")
+        loan_type = str(profile.loan_type or "")
+        monthly_income = float(profile.monthly_income or 0)
 
-        for tier, ratio in self.tier_mix_targets.items():
-            target_count = ratio * next_total
-            current_count = float(counts.get(tier, 0))
-            deficit = target_count - current_count
-            if deficit > 0:
-                deficit_weights[tier] = deficit
+        if monthly_income >= 90000 or float(profile.loan_amount or 0) >= 2000000:
+            return "HIGH_NET_WORTH"
+        if loan_type == "Education Loan" and monthly_income <= 35000:
+            return "STUDENT"
+        if occupation in {"small business owner", "self employed", "consultant"}:
+            return "SELF_EMPLOYED_BUSINESS"
+        if occupation == "freelancer" and monthly_income <= 30000:
+            return "DAILY_WAGE_WORKER"
+        if occupation == "government employee" and int(profile.account_age_months or 0) >= 72:
+            return "RETIRED_PENSIONER"
 
-        if deficit_weights:
-            tiers = list(deficit_weights.keys())
-            weights = [deficit_weights[tier] for tier in tiers]
-            return self.random.choices(tiers, weights=weights, k=1)[0]
+        # Rural proxy: smaller salaried profiles outside major metro branch labels.
+        is_metro = any(city in branch for city in ["Mumbai", "Pune", "Bengaluru", "Delhi"])
+        if monthly_income <= 30000 and not is_metro:
+            return "SALARIED_RURAL"
+        return "SALARIED_URBAN"
 
-        tiers = list(self.tier_mix_targets.keys())
-        weights = [self.tier_mix_targets[tier] for tier in tiers]
-        return self.random.choices(tiers, weights=weights, k=1)[0]
+    def _opening_balance(self, archetype: str, monthly_income: float) -> tuple[float, float]:
+        if archetype == "HIGH_NET_WORTH":
+            return self.rng.uniform(300000, 3000000), 5000.0
+        if archetype == "SELF_EMPLOYED_BUSINESS":
+            return self.rng.uniform(20000, 450000), 2500.0
+        if archetype == "SALARIED_URBAN":
+            return self.rng.uniform(0.8 * monthly_income, 3.5 * monthly_income), 0.0
+        if archetype == "SALARIED_RURAL":
+            return self.rng.uniform(0.4 * monthly_income, 1.8 * monthly_income), 0.0
+        if archetype == "DAILY_WAGE_WORKER":
+            return self.rng.uniform(150, 1800), 0.0
+        if archetype == "RETIRED_PENSIONER":
+            return self.rng.uniform(1.2 * monthly_income, 4.0 * monthly_income), 0.0
+        if archetype == "STUDENT":
+            return self.rng.uniform(300, 3500), 0.0
+        return self.rng.uniform(2000, 12000), 0.0
 
-    def _randomize_event_for_target_tier(self, event: dict[str, Any], target_tier: str, *, attempt: int = 0) -> dict[str, Any]:
-        """Mutate event fields to make model output converge to a target tier while staying varied."""
-        evt = dict(event)
-        intensity = min(1.0, 0.35 + (attempt * 0.25))
+    def _load_personas(self) -> list[IndianBankingPersona]:
+        personas: list[IndianBankingPersona] = []
+        with SessionLocal() as db:
+            rows = db.query(CustomerProfile).order_by(CustomerProfile.customer_id.asc()).all()
+            for row in rows:
+                archetype = self._archetype_from_profile(row)
+                opening_balance, overdraft_limit = self._opening_balance(archetype, float(row.monthly_income or 0))
+                simulated_time = self.realism.now_ist() - timedelta(days=self.rng.randint(1, 32), hours=self.rng.randint(1, 16))
+                persona = IndianBankingPersona(
+                    customer_id=row.customer_id,
+                    archetype=archetype,
+                    monthly_income=float(row.monthly_income or 0),
+                    loan_amount=float(row.loan_amount or 0),
+                    loan_type=str(row.loan_type or ""),
+                    occupation=str(row.occupation or ""),
+                    branch=str(row.branch or ""),
+                    overdraft_limit=overdraft_limit,
+                    current_balance=round(opening_balance, 2),
+                    simulated_time=simulated_time,
+                )
+                if self.rng.random() < 0.15:
+                    persona.scenario = self.rng.choice(SCENARIO_CODES)
+                    persona.scenario_step = 0
+                    persona.scenario_until = simulated_time + timedelta(days=self.rng.randint(5, 20))
+                personas.append(persona)
 
-        safe_events = ["PAYMENT", "INCOME_CREDIT", "PARTIAL_PAYMENT", "LOAN_CLOSED", "SETTLEMENT_OFFER"]
-        high_events = ["MISSED_PAYMENT", "CREDIT_UTILIZATION_UPDATE", "PARTIAL_PAYMENT", "LOAN_INQUIRY"]
-        critical_events = ["MISSED_PAYMENT", "PENALTY_APPLIED", "LEGAL_NOTICE_SENT", "CREDIT_UTILIZATION_UPDATE"]
-        risky_merchants = ["Cash Advance", "Travel", "Electronics", "Online Shopping"]
+        print(f"[STREAM] Loaded {len(personas)} customer profiles from database for streaming")
+        return personas
 
-        if target_tier == "LOW_RISK":
-            evt["event_type"] = self.random.choice(safe_events)
-            evt["days_past_due"] = self.random.randint(0, 2)
-            evt["days_since_last_payment"] = evt["days_past_due"]
-            evt["previous_declines_24h"] = self.random.randint(0, 0)
-            evt["missed_payment_count"] = self.random.randint(0, 1)
-            evt["payment_streak"] = self.random.randint(6, 24)
-            evt["credit_utilization"] = round(self.random.uniform(0.08, 0.35), 4)
-            evt["debt_to_income"] = round(self.random.uniform(0.12, 0.35), 4)
-            evt["num_active_loans"] = self.random.randint(1, 2)
-            evt["is_international"] = "false"
-            evt["merchant_category"] = _merchant_category_for_event_type(evt["event_type"])
-            evt["amount"] = round(max(1000.0, float(evt.get("amount", 5000.0)) * self.random.uniform(0.45, 0.9)), 2)
+    def _next_round_robin_persona(self) -> IndianBankingPersona:
+        persona = self.personas[self._round_robin_index]
+        self._round_robin_index = (self._round_robin_index + 1) % len(self.personas)
+        return persona
 
-        elif target_tier == "HIGH_RISK":
-            evt["event_type"] = self.random.choice(high_events)
-            evt["days_past_due"] = self.random.randint(18, int(42 + 8 * intensity))
-            evt["days_since_last_payment"] = evt["days_past_due"]
-            evt["previous_declines_24h"] = self.random.randint(1, 2)
-            evt["missed_payment_count"] = self.random.randint(1, 3)
-            evt["payment_streak"] = self.random.randint(0, 3)
-            evt["credit_utilization"] = round(self.random.uniform(0.62, min(0.84, 0.76 + 0.06 * intensity)), 4)
-            evt["debt_to_income"] = round(self.random.uniform(0.50, min(0.72, 0.66 + 0.05 * intensity)), 4)
-            evt["num_active_loans"] = self.random.randint(2, 4)
-            evt["is_international"] = "true" if self.random.random() < 0.12 else "false"
-            evt["merchant_category"] = self.random.choice(risky_merchants)
-            evt["amount"] = round(max(2500.0, float(evt.get("amount", 8000.0)) * self.random.uniform(0.9, 1.4)), 2)
+    def _emit_event(self, persona: IndianBankingPersona) -> None:
+        payload = self.generator.generate_next(persona)
 
-        elif target_tier == "CRITICAL":
-            evt["event_type"] = self.random.choice(critical_events)
-            evt["days_past_due"] = self.random.randint(55, int(95 + 18 * intensity))
-            evt["days_since_last_payment"] = evt["days_past_due"]
-            evt["previous_declines_24h"] = self.random.randint(2, 4)
-            evt["missed_payment_count"] = self.random.randint(3, 6)
-            evt["payment_streak"] = 0
-            evt["credit_utilization"] = round(self.random.uniform(0.80, min(0.95, 0.90 + 0.04 * intensity)), 4)
-            evt["debt_to_income"] = round(self.random.uniform(0.70, min(0.90, 0.84 + 0.03 * intensity)), 4)
-            evt["num_active_loans"] = self.random.randint(3, 5)
-            evt["is_international"] = "true" if self.random.random() < 0.30 else "false"
-            evt["merchant_category"] = self.random.choice(["Cash Advance", "Travel", "Electronics", "Legal"])
-            evt["amount"] = round(max(5000.0, float(evt.get("amount", 12000.0)) * self.random.uniform(1.15, 1.9)), 2)
+        # Keep compatibility with downstream consumer/parser keys.
+        payload["balance_after"] = payload["current_balance"]
+        payload["timestamp"] = payload["transaction_time"]
+        payload["days_past_due"] = payload["days_since_last_payment"]
 
-        else:  # VERY_CRITICAL
-            evt["event_type"] = self.random.choice(["LEGAL_NOTICE_SENT", "MISSED_PAYMENT", "PENALTY_APPLIED"])
-            evt["days_past_due"] = self.random.randint(120, 180)
-            evt["days_since_last_payment"] = evt["days_past_due"]
-            evt["previous_declines_24h"] = self.random.randint(4, 6)
-            evt["missed_payment_count"] = self.random.randint(6, 10)
-            evt["payment_streak"] = 0
-            evt["credit_utilization"] = round(self.random.uniform(0.94, 0.99), 4)
-            evt["debt_to_income"] = round(self.random.uniform(0.86, 0.90), 4)
-            evt["num_active_loans"] = self.random.randint(4, 6)
-            evt["is_international"] = "true" if self.random.random() < 0.45 else "false"
-            evt["merchant_category"] = self.random.choice(["Cash Advance", "Legal", "Travel"])
-            evt["amount"] = round(max(9000.0, float(evt.get("amount", 15000.0)) * self.random.uniform(1.4, 2.3)), 2)
+        # Score each streamed event before publishing so registry/dashboard do not
+        # persist zero placeholders from the consumer default path.
+        try:
+            prediction = predict_risk(payload)
+            payload["risk_score"] = float(prediction.get("risk_score", 0.0) or 0.0)
+            payload["risk_bucket"] = str(prediction.get("risk_bucket") or "UNKNOWN")
+            payload["base_model_risk_score"] = prediction.get("base_model_risk_score")
+            payload["context_model_risk_score"] = prediction.get("context_model_risk_score")
+        except Exception as score_err:
+            print(f"[STREAM] scoring failed for {payload.get('customer_id')}: {score_err}")
+            payload["risk_score"] = 0.0
+            payload["risk_bucket"] = "UNKNOWN"
 
-        evt["days_past_due"] = max(0, min(180, int(evt.get("days_past_due", 0))))
-        evt["days_since_last_payment"] = evt["days_past_due"]
-        evt["credit_utilization"] = round(float(max(0.0, min(0.99, float(evt.get("credit_utilization", 0.2))))), 4)
-        evt["debt_to_income"] = round(float(max(0.1, min(0.9, float(evt.get("debt_to_income", 0.3))))), 4)
-        evt["previous_declines_24h"] = max(0, min(6, int(evt.get("previous_declines_24h", 0))))
-        evt["missed_payment_count"] = max(0, int(evt.get("missed_payment_count", 0)))
-        evt["payment_streak"] = max(0, int(evt.get("payment_streak", 0)))
-        evt["num_active_loans"] = max(1, min(6, int(evt.get("num_active_loans", 1))))
+        stream_id = stream_publish(payload, maxlen=self.stream_maxlen)
 
-        balance_before = float(evt.get("balance_before", evt.get("balance_after", 0.0)) or 0.0)
-        balance = balance_before
-        amount = float(evt.get("amount", 0.0) or 0.0)
-        if evt["event_type"] in {"INCOME_CREDIT", "LOAN_OPENED"}:
-            credit = max(100.0, amount)
-            balance = balance_before + credit
-        elif evt["event_type"] in {"PAYMENT", "PARTIAL_PAYMENT", "SETTLEMENT_OFFER", "LOAN_CLOSED", "CREDIT_UTILIZATION_UPDATE"}:
-            max_debit = max(500.0, balance_before * self.random.uniform(0.08, 0.45))
-            debit = min(max(amount, 0.0), max_debit)
-            balance = max(0.0, balance_before - debit)
-        elif evt["event_type"] in {"PENALTY_APPLIED", "MISSED_PAYMENT", "LEGAL_NOTICE_SENT"}:
-            max_charge = max(250.0, balance_before * self.random.uniform(0.03, 0.25))
-            charge = min(max(amount * self.random.uniform(0.08, 0.35), 0.0), max_charge)
-            balance = max(0.0, balance_before - charge)
-        evt["balance_after"] = round(balance, 2)
-        return evt
-
-    def _predict_event(self, customer_id: str, event: dict[str, Any]) -> dict[str, Any]:
-        features = self._build_model_features(event)
-        return predict_risk({"customer_id": customer_id, **features})
-
-    # ------------------------------------------------------------------
-    # Scenario injection / mutations
-    # ------------------------------------------------------------------
-
-    def _scenario_mutations(self, persona: PersonaState, event: dict[str, Any]) -> tuple[dict[str, Any], str | None, int]:
-        scenario = self.active_scenario
-        if scenario is None or scenario.customer_id != persona.customer_id:
-            return event, None, 0
-
-        sid = scenario.scenario_id
-        scenario.remaining_cycles = max(0, scenario.remaining_cycles - 1)
-        scenario.seen_cycles += 1
-
-        if sid == "A_BOUNDARY_FLOATER":
-            # BUG-16 fix: use feature-level values that land near HIGH/CRITICAL boundary
-            # Target score ~60–72 by oscillating utilization and DPD simultaneously
-            oscillate = scenario.seen_cycles % 2
-            event["credit_utilization"] = round(0.68 + (0.06 if oscillate else -0.04), 4)
-            event["debt_to_income"] = round(0.58 + (0.04 if oscillate else -0.02), 4)
-            event["days_past_due"] = 20 + (oscillate * 15)
-            event["days_since_last_payment"] = event["days_past_due"]
-            event["payment_streak"] = 0 if oscillate else 2
-
-        elif sid == "B_RAPID_ESCALATION":
-            event["event_type"] = "MISSED_PAYMENT"
-            event["days_past_due"] = min(180, 15 + scenario.seen_cycles * 12)
-            event["days_since_last_payment"] = event["days_past_due"]
-            event["credit_utilization"] = min(0.99, 0.65 + scenario.seen_cycles * 0.06)
-            event["debt_to_income"] = min(0.90, 0.55 + scenario.seen_cycles * 0.06)
-            event["missed_payment_count"] = scenario.seen_cycles
-            event["payment_streak"] = 0
-
-        elif sid == "C_DATA_SPARSITY":
-            # BUG-17 fix: inject actual None/sparse values to exercise null-handling
-            event["credit_utilization"] = None
-            event["debt_to_income"] = None
-            event["monthly_income"] = 0.0
-            event["payment_streak"] = 0
-            event["missed_payment_count"] = 0
-            event["account_age_months"] = min(3, event.get("account_age_months", 3))
-            event["amount"] = round(event["amount"] * 0.35, 2)
-            event["outstanding_balance"] = round(max(1000.0, event["outstanding_balance"] * 0.5), 2)
-
-        elif sid == "D_INCOME_SHOCK":
-            event["monthly_income"] = 0.0 if scenario.seen_cycles <= 3 else round(persona.monthly_income, 2)
-            event["debt_to_income"] = 0.9 if event["monthly_income"] == 0 else max(0.3, event["debt_to_income"])
-
-        elif sid == "E_PARTIAL_PAYMENT_PATTERN":
-            event["event_type"] = "PARTIAL_PAYMENT"
-            event["amount"] = round(event["amount"] * 0.6, 2)
-            event["days_past_due"] = 0
-            event["days_since_last_payment"] = 0
-
-        elif sid == "F_MULTIPLE_SIMULTANEOUS_LOANS_SPIKE":
-            event["event_type"] = "LOAN_OPENED"
-            event["num_active_loans"] = min(6, 2 + scenario.seen_cycles)
-            event["credit_utilization"] = min(0.99, (event.get("credit_utilization") or 0.5) + 0.08)
-
-        elif sid == "G_SETTLEMENT_OFFER_ACCEPTED":
-            event["event_type"] = "SETTLEMENT_OFFER"
-            event["days_past_due"] = max(0, event["days_past_due"] - 30)
-            event["days_since_last_payment"] = event["days_past_due"]
-            event["credit_utilization"] = max(0.25, (event.get("credit_utilization") or 0.7) - 0.2)
-
-        elif sid == "H_ZOMBIE_ACCOUNT":
-            # MISSING-03 fix: simulate 6-month dormancy then sudden activity
-            if scenario.seen_cycles <= 6:
-                # Dormant phase: minimal loan-inquiry events, DPD accrues
-                event["event_type"] = "LOAN_INQUIRY"
-                event["amount"] = 0.0
-                event["days_past_due"] = min(180, scenario.seen_cycles * 22)
-                event["days_since_last_payment"] = event["days_past_due"]
-                event["credit_utilization"] = min(0.95, 0.2 + scenario.seen_cycles * 0.1)
-            else:
-                # Reactivation phase: sudden large transaction
-                event["event_type"] = "CREDIT_UTILIZATION_UPDATE"
-                event["amount"] = round(max(25000.0, event["amount"] * 2.5), 2)
-                event["credit_utilization"] = min(0.99, (event.get("credit_utilization") or 0.5) + 0.30)
-
-        elif sid == "I_NPA_BOUNDARY":
-            event["days_past_due"] = min(90, 87 + scenario.seen_cycles)
-            event["days_since_last_payment"] = event["days_past_due"]
-            event["event_type"] = "MISSED_PAYMENT"
-            event["credit_utilization"] = min(0.99, (event.get("credit_utilization") or 0.7) + 0.05)
-            event["missed_payment_count"] = max(3, event.get("missed_payment_count", 3))
-
-        elif sid == "J_FEATURE_DRIFT_INJECTION":
-            event["credit_utilization"] = min(0.99, (event.get("credit_utilization") or 0.5) + 0.08)
-            event["debt_to_income"] = min(0.9, (event.get("debt_to_income") or 0.4) + 0.06)
-
-        expected = scenario.expected_tier
-        if scenario.remaining_cycles == 0:
-            self.active_scenario = None
-        return event, expected, scenario.seen_cycles
-
-    def _start_next_scenario(self) -> None:
-        sid = SCENARIO_IDS[self.scenario_index % len(SCENARIO_IDS)]
-        self.scenario_index += 1
-
-        if sid == "J_FEATURE_DRIFT_INJECTION" and not self.inject_drift:
-            self.next_scenario_due = get_ist_now() + timedelta(minutes=self.scenario_interval_minutes)
-            return
-
-        persona = self.random.choice(self.personas)
-
-        # BUG-07 fix: VERY_CRITICAL requires score ≥ 90 (not 98.5) — use CRITICAL for 
-        # scenarios where model reliably hits 75+.  NPA boundary targets CRITICAL given
-        # DPD=89–90 consistently pushes delinquency_signal near ceiling.
-        expected_by_scenario = {
-            "A_BOUNDARY_FLOATER": "HIGH_RISK",
-            "B_RAPID_ESCALATION": "CRITICAL",
-            "C_DATA_SPARSITY": "HIGH_RISK",
-            "D_INCOME_SHOCK": "CRITICAL",
-            "E_PARTIAL_PAYMENT_PATTERN": "HIGH_RISK",
-            "F_MULTIPLE_SIMULTANEOUS_LOANS_SPIKE": "CRITICAL",
-            "G_SETTLEMENT_OFFER_ACCEPTED": "HIGH_RISK",
-            "H_ZOMBIE_ACCOUNT": "HIGH_RISK",
-            "I_NPA_BOUNDARY": "CRITICAL",
-            "J_FEATURE_DRIFT_INJECTION": "CRITICAL",
-        }
-        cycles = {
-            "A_BOUNDARY_FLOATER": 10,
-            "B_RAPID_ESCALATION": 6,
-            "C_DATA_SPARSITY": 5,
-            "D_INCOME_SHOCK": 6,
-            "E_PARTIAL_PAYMENT_PATTERN": 8,
-            "F_MULTIPLE_SIMULTANEOUS_LOANS_SPIKE": 5,
-            "G_SETTLEMENT_OFFER_ACCEPTED": 5,
-            "H_ZOMBIE_ACCOUNT": 10,  # extended for dormancy phase
-            "I_NPA_BOUNDARY": 4,
-            "J_FEATURE_DRIFT_INJECTION": 12,
-        }
-        self.active_scenario = ScenarioRuntime(
-            scenario_id=sid,
-            customer_id=persona.customer_id,
-            expected_tier=expected_by_scenario[sid],
-            remaining_cycles=cycles[sid],
-            tolerance_cycles=2,
-        )
-        self.next_scenario_due = get_ist_now() + timedelta(minutes=self.scenario_interval_minutes)
+        self.published_count += 1
+        self.last_publish_at = time.time()
+        self.event_type_counter[payload["event_type"]] += 1
+        self.archetype_counter[payload["archetype"]] += 1
 
         print(
-            f"[SCENARIO INJECTED] ID: {sid} | "
-            f"Customer: {persona.customer_id} | "
-            f"Expected Tier: {expected_by_scenario[sid]} | "
-            f"Duration: {cycles[sid]} cycles"
+            f"[TX] {payload['customer_id']} | {payload['archetype']} | {payload['event_type']} | "
+            f"{payload['merchant_category']} | INR {payload['amount']:.2f} | Bal {payload['current_balance']:.2f} | "
+            f"Score {payload['risk_score']:.2f} {payload['risk_bucket']} | "
+            f"Decl24h {payload['previous_declines_24h']} | Scn {payload['scenario'] or 'NONE'} | {stream_id}"
         )
 
-    # ------------------------------------------------------------------
-    # Assertion recording
-    # ------------------------------------------------------------------
-
-    def _record_assertion(
-        self,
-        scenario_id: str,
-        customer_id: str,
-        expected_tier: str,
-        actual_tier: str,
-        cycles: int,
-    ) -> None:
-        passed = actual_tier == expected_tier
-        assertion = ScenarioAssertion(
-            scenario_id=scenario_id,
-            customer_id=customer_id,
-            expected_tier=expected_tier,
-            actual_tier=actual_tier,
-            cycles_to_converge=cycles,
-            passed=passed,
-            timestamp=get_ist_now().isoformat(),
-        )
-        self.assertions.append(assertion)
-        payload = {
-            "scenario_id": assertion.scenario_id,
-            "customer_id": assertion.customer_id,
-            "expected_tier": assertion.expected_tier,
-            "actual_tier": assertion.actual_tier,
-            "cycles_to_converge": assertion.cycles_to_converge,
-            "passed": assertion.passed,
-            "timestamp": assertion.timestamp,
-        }
-        append_stream_metric(payload, key=STREAM_ASSERTION_KEY, maxlen=5000)
-
-        status = "[PASS]" if passed else "[FAIL]"
-        print(
-            f"[ASSERTION {status}] Scenario: {scenario_id} | "
-            f"Customer: {customer_id} | "
-            f"Expected: {expected_tier} | "
-            f"Actual: {actual_tier} | "
-            f"Cycles: {cycles}"
-        )
-
-    # ------------------------------------------------------------------
-    # Metrics
-    # ------------------------------------------------------------------
+        if self.published_count % 25 == 0:
+            self._publish_metrics()
 
     def _publish_metrics(self) -> None:
-        now = time.time()
-        elapsed = max(1e-6, now - self.last_metrics_at)
-        events_per_second = round(self.events_in_window / elapsed, 3)
-        self.events_in_window = 0
-        self.last_metrics_at = now
+        runtime = max(1.0, time.time() - self.started_at)
+        eps = round(self.published_count / runtime, 3)
+        pending = int(get_hash_fields(STREAM_HEALTH_KEY).get("pending_count", 0) or 0)
 
-        archetype_counter = Counter(self.recent_archetypes)
-        # BUG-12 fix: pending_count = delivered-but-not-ACKed; consumer_lag = stream length - pending
-        pending = get_stream_pending_count(STREAM_KEY, STREAM_CONSUMER_GROUP)
-        stream_len = get_stream_length(STREAM_KEY)
-        consumer_lag = max(0, stream_len - pending)
-
-        metric_payload = {
-            "timestamp": get_ist_now().isoformat(),
-            "pending_count": pending,
-            "consumer_lag": consumer_lag,
-            "stream_length": stream_len,
-            "events_per_second": events_per_second,
-            "archetype_distribution": dict(archetype_counter),
-            "scenario_currently_active": (
-                "DISABLED_BY_TIER_MIX"
-                if self.enforce_tier_mix
-                else (self.active_scenario.scenario_id if self.active_scenario else "NONE")
-            ),
-            "tier_mix_targets": self.tier_mix_targets if self.enforce_tier_mix else {},
-            "tier_mix_window": self.tier_mix_window,
+        health_payload = {
+            "events_published": str(self.published_count),
+            "events_per_second": str(eps),
+            "archetype_distribution": json.dumps(dict(self.archetype_counter)),
+            "event_type_distribution": json.dumps(dict(self.event_type_counter)),
+            "pending_count": str(pending),
+            "updated_at": self.realism.now_ist().isoformat(),
         }
-        set_hash_fields(STREAM_HEALTH_KEY, metric_payload)
-        append_stream_metric(metric_payload)
-
-        print(
-            f"[METRICS] Events/sec: {events_per_second} | "
-            f"Pending: {pending} | Lag: {consumer_lag} | "
-            f"StreamLen: {stream_len} | "
-            f"Archetypes: {len(archetype_counter)} | "
-            f"Scenario: {metric_payload.get('scenario_currently_active', 'NONE')}"
+        set_hash_fields(STREAM_HEALTH_KEY, health_payload)
+        append_stream_metric(
+            {
+                "timestamp": self.realism.now_ist().isoformat(),
+                "events_published": self.published_count,
+                "events_per_second": eps,
+                "archetype_distribution": dict(self.archetype_counter),
+                "event_type_distribution": dict(self.event_type_counter),
+            },
+            key="pie:stream:metrics",
+            maxlen=10000,
         )
-
-    # ------------------------------------------------------------------
-    # Core event emission
-    # ------------------------------------------------------------------
-
-    def _emit_event(self, persona: PersonaState) -> None:
-        self._advance_time(persona)
-        event_type = self._calendar_event_type(persona)
-        event_type, amount = self._apply_archetype_dynamics(persona, event_type)
-        event = self._build_event(persona, event_type, amount)
-
-        expected_tier: str | None = None
-        scenario_cycles = 0
-        scenario_id: str | None = None
-        active_scenario_snapshot: ScenarioRuntime | None = self.active_scenario
-
-        if active_scenario_snapshot and not self.enforce_tier_mix:
-            scenario_id = active_scenario_snapshot.scenario_id
-            event, expected_tier, scenario_cycles = self._scenario_mutations(persona, event)
-
-        prediction: dict[str, Any]
-        if self.enforce_tier_mix:
-            target_tier = self._pick_target_tier()
-            trial_event = dict(event)
-            prediction = self._predict_event(persona.customer_id, trial_event)
-
-            for attempt in range(5):
-                predicted_tier = get_risk_bucket(float(prediction["risk_score"]))
-                if predicted_tier == target_tier:
-                    break
-                trial_event = self._randomize_event_for_target_tier(trial_event, target_tier, attempt=attempt)
-                prediction = self._predict_event(persona.customer_id, trial_event)
-
-            event = trial_event
-        else:
-            prediction = self._predict_event(persona.customer_id, event)
-
-        persona.risk_score_prev = float(prediction["risk_score"])
-
-        event["risk_score_prev"] = round(persona.risk_score_prev, 2)
-        event["risk_score"] = round(float(prediction["risk_score"]), 2)
-        event["risk_bucket"] = str(prediction["risk_bucket"])
-
-        # Strip archetype tag before publishing (prevent data leakage to model consumer)
-        clean_event = dict(event)
-        clean_event.pop("archetype", None)
-
-        stream_publish(clean_event, maxlen=self.max_stream_len)
-        self.recent_archetypes.append(persona.archetype)
-        self.recent_tiers.append(str(event["risk_bucket"]))
-        self.events_in_window += 1
-
-        risk_bucket = get_risk_bucket(float(prediction["risk_score"]))
-        print(
-            f"[TX] {persona.customer_id} | ₹{amount:.0f} | {event_type} | "
-            f"{persona.archetype} | Score: {prediction['risk_score']:.1f} | "
-            f"{risk_bucket} | {event.get('timestamp', 'N/A')[:19]} | "
-            f"Scenario: {scenario_id or 'NONE'}"
-        )
-
-        # BUG-06 fix: record assertion only after the tolerance window expires or tier converges
-        if expected_tier and scenario_id and active_scenario_snapshot:
-            actual_tier = get_risk_bucket(float(prediction["risk_score"]))
-            tolerance = active_scenario_snapshot.tolerance_cycles
-            tier_matched = actual_tier == expected_tier
-            window_expired = scenario_cycles >= (active_scenario_snapshot.remaining_cycles == 0 and scenario_cycles or tolerance + scenario_cycles)
-
-            # Record when tier matches OR when the scenario has fully run out of cycles
-            if tier_matched or (active_scenario_snapshot.remaining_cycles == 0):
-                self._record_assertion(
-                    scenario_id,
-                    persona.customer_id,
-                    expected_tier,
-                    actual_tier,
-                    scenario_cycles,
-                )
-
-    # ------------------------------------------------------------------
-    # Main run loop
-    # ------------------------------------------------------------------
 
     def run(self) -> None:
         print(
-            f"[STREAM] Producer started | "
-            f"Mode: {'burst' if self.stream_burst else 'per-customer'} | "
-            f"Seed: {self.stream_seed} | "
-            f"TimeAdvance: {self._time_advance_hours}h/event | "
-            f"Personas: {len(self.personas)}"
+            f"[STREAM] Producer started | Stream={self.stream_key} | Personas={len(self.personas)} | "
+            f"Per-customer cadence={self.stream_min_seconds:.1f}-{self.stream_max_seconds:.1f}s"
         )
+        if not self.personas:
+            print("[STREAM] No personas loaded; producer exiting")
+            return
+
         while not self.stop_event.is_set():
             if self.pause_event.is_set():
-                time.sleep(0.5)
+                time.sleep(0.25)
                 continue
 
-            if (not self.enforce_tier_mix) and get_ist_now() >= self.next_scenario_due and self.active_scenario is None:
-                self._start_next_scenario()
+            persona = self._next_round_robin_persona()
+            now = time.time()
+            due_at = self.next_due_at.get(persona.customer_id, now)
 
-            current_time = time.time()
+            if now >= due_at:
+                self._emit_event(persona)
+                self.next_due_at[persona.customer_id] = now + self.rng.uniform(self.stream_min_seconds, self.stream_max_seconds)
 
-            if self.per_customer_mode and not self.stream_burst:
-                # Per-customer: one transaction per customer every 5–10 seconds
-                for persona in self.personas:
-                    if self.stop_event.is_set() or self.pause_event.is_set():
-                        break
-
-                    last_event_time = self.last_event_times.get(persona.customer_id, 0)
-                    # BUG-11 fix: use seeded self.random, not global random module
-                    interval = self.random.uniform(self.stream_interval_min, self.stream_interval_max)
-
-                    if current_time - last_event_time >= interval:
-                        self._emit_event(persona)
-                        self.last_event_times[persona.customer_id] = current_time
-
-                time.sleep(0.1)
-            else:
-                # Burst / fixed-rate mode
-                events_to_emit = 500 if self.stream_burst else self.stream_rate_per_second
-                for _ in range(events_to_emit):
-                    persona = self.random.choice(self.personas)
-                    self._emit_event(persona)
-                    if self.stop_event.is_set() or self.pause_event.is_set():
-                        break
-                time.sleep(1.0)
-
-            if time.time() - self.last_metrics_at >= 30:
-                self._publish_metrics()
+            time.sleep(0.03)
 
         self._publish_metrics()
 
@@ -1078,71 +989,22 @@ class AdvancedRedisStreamProducer:
         self.pause_event.clear()
 
     def report(self) -> dict[str, Any]:
-        assertions = list(self.assertions)
-        total = len(assertions)
-        passed = sum(1 for row in assertions if row.passed)
-        by_scenario: dict[str, dict[str, Any]] = {}
-        for row in assertions:
-            bucket = by_scenario.setdefault(row.scenario_id, {"count": 0, "passed": 0, "cycles": []})
-            bucket["count"] += 1
-            if row.passed:
-                bucket["passed"] += 1
-            bucket["cycles"].append(row.cycles_to_converge)
-
-        scenario_rows = []
-        for sid, data in sorted(by_scenario.items()):
-            avg_cycles = (sum(data["cycles"]) / len(data["cycles"])) if data["cycles"] else 0.0
-            scenario_rows.append(
-                {
-                    "scenario_id": sid,
-                    "count": data["count"],
-                    "pass_rate": round((data["passed"] / max(1, data["count"])) * 100.0, 2),
-                    "avg_cycles_to_converge": round(avg_cycles, 2),
-                }
-            )
-
-        failed = [
-            {
-                "scenario_id": row.scenario_id,
-                "customer_id": row.customer_id,
-                "expected_tier": row.expected_tier,
-                "actual_tier": row.actual_tier,
-                "cycles_to_converge": row.cycles_to_converge,
-                "timestamp": row.timestamp,
-            }
-            for row in assertions
-            if not row.passed
-        ]
-
-        # MISSING-05 fix: include real-time monitoring fields at the top level
-        stream_health = get_hash_fields(STREAM_HEALTH_KEY)
-        observed_tier_distribution = dict(Counter(self.recent_tiers))
+        runtime = max(1.0, time.time() - self.started_at)
         return {
-            "total_assertions": total,
-            "pass_rate": round((passed / max(1, total)) * 100.0, 2),
-            "avg_cycles_to_converge": round(
-                sum(row.cycles_to_converge for row in assertions) / max(1, total),
-                2,
-            ),
-            "scenario_summary": scenario_rows,
-            "failed_scenarios": failed[-50:],
-            # Real-time monitoring fields (MISSING-05)
-            "scenario_currently_active": (
-                "DISABLED_BY_TIER_MIX"
-                if self.enforce_tier_mix
-                else (self.active_scenario.scenario_id if self.active_scenario else "NONE")
-            ),
-            "events_per_second": float(stream_health.get("events_per_second", 0)),
-            "archetype_distribution": stream_health.get("archetype_distribution", {}),
-            "observed_tier_distribution": observed_tier_distribution,
-            "consumer_lag": int(stream_health.get("consumer_lag", 0)),
-            "pending_count": int(stream_health.get("pending_count", 0)),
-            "stream_health": stream_health,
+            "status": "running" if not self.stop_event.is_set() else "stopped",
+            "events_published": self.published_count,
+            "events_per_second": round(self.published_count / runtime, 3),
+            "archetype_distribution": dict(self.archetype_counter),
+            "event_type_distribution": dict(self.event_type_counter),
+            "active_scenarios": {
+                p.customer_id: p.scenario for p in self.personas if p.scenario
+            },
+            "stream_health": get_hash_fields(STREAM_HEALTH_KEY),
         }
 
 
 # ---------------------------------------------------------------------------
-# Module-level lifecycle helpers
+# Module-level lifecycle helpers (kept for integration compatibility)
 # ---------------------------------------------------------------------------
 
 _PRODUCER: AdvancedRedisStreamProducer | None = None
@@ -1187,16 +1049,11 @@ def get_stream_test_report() -> dict[str, Any]:
     if not _PRODUCER:
         return {
             "status": "producer_not_running",
-            "stream_health": get_hash_fields(STREAM_HEALTH_KEY),
-            "total_assertions": 0,
-            "pass_rate": 0.0,
-            "avg_cycles_to_converge": 0.0,
-            "scenario_summary": [],
-            "failed_scenarios": [],
-            "scenario_currently_active": "NONE",
+            "events_published": 0,
             "events_per_second": 0.0,
             "archetype_distribution": {},
-            "consumer_lag": 0,
-            "pending_count": 0,
+            "event_type_distribution": {},
+            "active_scenarios": {},
+            "stream_health": get_hash_fields(STREAM_HEALTH_KEY),
         }
     return _PRODUCER.report()

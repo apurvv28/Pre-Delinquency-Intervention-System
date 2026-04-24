@@ -1,3 +1,4 @@
+import os
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -6,8 +7,10 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy import delete
 from sqlalchemy.orm import Session
 
-from backend.cache import redis
+from backend.cache import redis, stream_create_group
 from backend.database import CustomerTransaction, RiskScore, get_db
+from backend.stream_consumer import start_stream_consumer, stop_stream_consumer
+from backend.stream_producer import start_advanced_stream_producer, stop_advanced_stream_producer
 from backend.timezone_util import get_ist_now
 from backend.drift_retrain_pipeline import (
     DRIFT_RETRAIN_THRESHOLD,
@@ -174,11 +177,23 @@ async def restart_stream(request: Request, db: Session = Depends(get_db)):
     4. Deletes and recreates the consumer group
     
     After this, the stream producer/consumer will restart fresh,
-    flowing transactions through the ML models (LightGBM + XGBoost fusion).
+    flowing transactions through the ML models (LightGBM -> XGBoost sequential pipeline).
     """
     actor = _actor_from_request(request)
     
     try:
+        # Restart stream workers so the pipeline starts fresh from 0 transactions.
+        workers_restarted = False
+        use_advanced_stream_producer = os.getenv("USE_ADVANCED_STREAM_PRODUCER", "true").strip().lower() in {"1", "true", "yes", "on"}
+        stream_disabled = os.getenv("DISABLE_TRANSACTION_STREAM", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+        if not stream_disabled:
+            try:
+                stop_stream_consumer()
+                stop_advanced_stream_producer()
+            except Exception as e:
+                print(f"[STREAM_RESTART] Note: worker stop failed: {e}")
+
         # Delete all transactions
         db.execute(delete(CustomerTransaction))
         db.commit()
@@ -221,6 +236,21 @@ async def restart_stream(request: Request, db: Session = Depends(get_db)):
             print(f"[STREAM_RESTART] Cleared Redis risk cache")
         except Exception as e:
             print(f"[STREAM_RESTART] Note: Risk cache cleanup: {e}")
+
+        if not stream_disabled:
+            try:
+                stream_create_group()
+            except Exception as e:
+                print(f"[STREAM_RESTART] WARNING: stream group create failed: {e}")
+
+        if not stream_disabled and use_advanced_stream_producer:
+            try:
+                start_advanced_stream_producer()
+                start_stream_consumer()
+                workers_restarted = True
+                print("[STREAM_RESTART] Restarted advanced stream producer + consumer")
+            except Exception as e:
+                print(f"[STREAM_RESTART] WARNING: worker restart failed: {e}")
         
         return {
             "status": "success",
@@ -232,9 +262,14 @@ async def restart_stream(request: Request, db: Session = Depends(get_db)):
                 "consumer_group": consumer_group,
                 "cache": "risk:*"
             },
+            "workers": {
+                "stream_disabled": stream_disabled,
+                "advanced_stream_enabled": use_advanced_stream_producer,
+                "restarted": workers_restarted,
+            },
             "actor": actor,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "next_steps": "Streamed transactions will now flow through LightGBM + XGBoost fusion model and appear in customer registry."
+            "next_steps": "Streamed transactions will now flow through the LightGBM -> XGBoost sequential model and appear in customer registry."
         }
         
     except Exception as e:

@@ -29,10 +29,17 @@ from backend.database import CustomerTransaction, RiskScore, SessionLocal
 from backend.predict import predict_risk
 from backend.timezone_util import get_ist_now
 from backend.websocket_manager import manager
+from backend.intervention_system import auto_escalate_critical_customer
 
 STREAM_KEY = os.getenv("REDIS_STREAM_KEY", "pie:transactions")
 STREAM_CONSUMER_GROUP = os.getenv("REDIS_CONSUMER_GROUP", "pie-prediction-engine")
 STREAM_CONSUMER_NAME = f"consumer-{os.getenv('HOSTNAME', 'default')}-{os.getpid()}"
+WS_BROADCAST_MODEL_OUTPUT = os.getenv("WS_BROADCAST_MODEL_OUTPUT", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 # Refresh the history-enriched risk score every N streamed transactions per customer.
 RISK_REFRESH_EVERY_N = int(os.getenv("RISK_REFRESH_EVERY_N", "10"))
@@ -47,12 +54,18 @@ consumer_running: bool = False
 
 
 def _run_async_broadcast(coro) -> None:
+    # Consumer runs in a background thread; schedule websocket sends on the
+    # main server loop where WebSocket connections were accepted.
+    if manager.loop and manager.loop.is_running():
+        asyncio.run_coroutine_threadsafe(coro, manager.loop)
+        return
+
     try:
-        asyncio.get_running_loop()
+        loop = asyncio.get_running_loop()
     except RuntimeError:
         asyncio.run(coro)
     else:
-        asyncio.create_task(coro)
+        loop.create_task(coro)
 
 def _merchant_category_for_event_type(event_type: str) -> str:
     return {
@@ -168,6 +181,22 @@ def _refresh_customer_risk_score(db, customer_id: str) -> None:
         f"[RISK_REFRESH] Customer: {customer_id} | Tx Count: {len(recent_rows)} | "
         f"Score: {score:.2f} | Bucket: {bucket}"
     )
+
+    # Auto-escalate via email if post-refresh score is >= 80%
+    if score >= 80.0:
+        try:
+            escalation_result = auto_escalate_critical_customer(
+                customer_id=customer_id,
+                risk_score=score,
+                actor="stream_auto_escalation",
+            )
+            if escalation_result:
+                print(
+                    f"[AUTO_ESCALATE] Triggered for {customer_id} | "
+                    f"Score: {score:.2f} | Result: {escalation_result.get('send_result', {}).get('status', 'N/A')}"
+                )
+        except Exception as escalation_err:
+            print(f"[AUTO_ESCALATE] Error for {customer_id}: {escalation_err}")
 
 
 # ---------------------------------------------------------------------------
@@ -333,12 +362,13 @@ def _process_transaction_event(event_id: str, event_data: dict) -> None:
             # Schedule async broadcasts
             _run_async_broadcast(manager.broadcast_transaction(tx_broadcast))
             _run_async_broadcast(manager.broadcast_score_update(customer_id, risk_score, risk_bucket))
-            _run_async_broadcast(manager.broadcast_model_output("transaction_processed", {
-                "customer_id": customer_id,
-                "transaction_index": next_index,
-                "fusion_score": risk_score,
-                "fusion_bucket": risk_bucket,
-            }))
+            if WS_BROADCAST_MODEL_OUTPUT:
+                _run_async_broadcast(manager.broadcast_model_output("transaction_processed", {
+                    "customer_id": customer_id,
+                    "transaction_index": next_index,
+                    "fusion_score": risk_score,
+                    "fusion_bucket": risk_bucket,
+                }))
         except Exception as ws_err:
             print(f"[STREAM_CONSUMER] WebSocket broadcast error: {ws_err}")
 

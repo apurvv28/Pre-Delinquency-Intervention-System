@@ -38,7 +38,33 @@ export function useStreamWebSocket(onEvent?: (event: StreamEvent) => void) {
   const wsRef = useRef<WebSocket | null>(null);
   const queryClient = useQueryClient();
   const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const invalidateTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pendingCustomerIdsRef = useRef<Set<string>>(new Set());
   const [isConnected, setIsConnected] = useState(false);
+  const invalidateDebounceMs = Number(import.meta.env.VITE_WS_INVALIDATE_DEBOUNCE_MS ?? 2000);
+
+  const scheduleInvalidation = useCallback((customerId?: string) => {
+    if (customerId) {
+      pendingCustomerIdsRef.current.add(customerId);
+    }
+
+    if (invalidateTimeoutRef.current) {
+      return;
+    }
+
+    invalidateTimeoutRef.current = setTimeout(() => {
+      queryClient.invalidateQueries({ queryKey: ['registryDashboard'] });
+      queryClient.invalidateQueries({ queryKey: ['customersDashboard'] });
+      queryClient.invalidateQueries({ queryKey: ['metricSnapshot'] });
+
+      pendingCustomerIdsRef.current.forEach((id) => {
+        queryClient.invalidateQueries({ queryKey: ['customer', id] });
+      });
+      pendingCustomerIdsRef.current.clear();
+
+      invalidateTimeoutRef.current = null;
+    }, Math.max(500, invalidateDebounceMs));
+  }, [invalidateDebounceMs, queryClient]);
 
   const resolveWebSocketUrl = () => {
     const apiBaseUrl = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000';
@@ -81,18 +107,11 @@ export function useStreamWebSocket(onEvent?: (event: StreamEvent) => void) {
             onEvent(message);
           }
 
-          // Invalidate relevant queries to trigger refetch
+          // Coalesce refetches to avoid overwhelming the UI during fast streams.
           if (message.type === 'transaction') {
-            queryClient.invalidateQueries({ queryKey: ['registryDashboard'] });
-            queryClient.invalidateQueries({ queryKey: ['customersDashboard'] });
-            queryClient.invalidateQueries({ queryKey: ['metricSnapshot'] });
+            scheduleInvalidation();
           } else if (message.type === 'risk_score_update') {
-            queryClient.invalidateQueries({ queryKey: ['registryDashboard'] });
-            queryClient.invalidateQueries({ queryKey: ['customersDashboard'] });
-            queryClient.invalidateQueries({ queryKey: ['metricSnapshot'] });
-            queryClient.invalidateQueries({ 
-              queryKey: ['customer', message.data.customer_id] 
-            });
+            scheduleInvalidation(message.data.customer_id);
           }
         } catch (err) {
           console.error('[WS] Failed to parse message:', err);
@@ -128,6 +147,11 @@ export function useStreamWebSocket(onEvent?: (event: StreamEvent) => void) {
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
       }
+      if (invalidateTimeoutRef.current) {
+        clearTimeout(invalidateTimeoutRef.current);
+        invalidateTimeoutRef.current = null;
+      }
+      pendingCustomerIdsRef.current.clear();
       if (wsRef.current) {
         wsRef.current.close();
         wsRef.current = null;

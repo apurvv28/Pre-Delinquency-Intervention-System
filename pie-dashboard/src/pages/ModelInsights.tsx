@@ -220,12 +220,12 @@ export default function ModelInsights() {
   return (
     <section className="space-y-6 p-6">
       <div className="rounded-xl border border-[#E2E6ED] bg-white p-5">
-        <h2 className="font-syne text-2xl text-[#0F172A]">Dual Model Insights</h2>
-        <p className="mt-1 text-sm text-[#64748B]">Live view of LightGBM base model and XGBoost contextual model before retraining controls.</p>
+        <h2 className="font-syne text-2xl text-[#0F172A]">Sequential Model Insights</h2>
+        <p className="mt-1 text-sm text-[#64748B]">LightGBM produces the upstream score and XGBoost turns that score into the final risk output.</p>
 
         <div className="mt-4 grid grid-cols-2 gap-4">
-          <ModelMetricsCard model={baseModel} title="Base Model (LightGBM)" />
-          <ModelMetricsCard model={contextualModel} title="Contextual Model (XGBoost)" />
+          <ModelMetricsCard model={baseModel} title="Stage 1: LightGBM Score" />
+          <ModelMetricsCard model={contextualModel} title="Stage 2: XGBoost Finalizer" />
         </div>
 
         <div className="mt-4 grid grid-cols-4 gap-3">
@@ -243,7 +243,7 @@ export default function ModelInsights() {
           </div>
           <div className="rounded-lg border border-[#E2E6ED] bg-[#F8FAFC] p-3 text-center">
             <p className="text-[11px] uppercase tracking-[0.12em] text-[#64748B]">Stage 4</p>
-            <p className="mt-1 font-dm-mono text-sm text-[#0F172A]">Final Fusion</p>
+            <p className="mt-1 font-dm-mono text-sm text-[#0F172A]">Final Score</p>
           </div>
         </div>
       </div>
@@ -336,7 +336,7 @@ export default function ModelInsights() {
           >
             {triggerRetrainMutation.isPending ? 'Triggering...' : 'Trigger Retraining'}
           </button>
-          <p className="mt-2 text-xs text-[#64748B]">Retraining target: Base model (LightGBM) only.</p>
+          <p className="mt-2 text-xs text-[#64748B]">Retraining target: Sequential XGBoost model fed by the LightGBM stage.</p>
         </article>
 
         <article className="col-span-6 rounded-xl border border-[#E2E6ED] bg-white p-5">

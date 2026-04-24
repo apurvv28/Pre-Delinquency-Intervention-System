@@ -728,6 +728,152 @@ def stop_intervention_scheduler() -> None:
         INTERVENTION_SCHEDULER.shutdown(wait=False)
 
 
+def auto_escalate_critical_customer(customer_id: str, risk_score: float, actor: str = "auto_escalation") -> dict | None:
+    """Auto-escalate a customer whose risk exceeds 80% after a periodic risk refresh.
+
+    Creates an intervention queue entry and immediately dispatches the email
+    without requiring manual admin approval. Only fires for CRITICAL and
+    VERY_CRITICAL buckets (score >= 80).
+    """
+    if risk_score < 80.0:
+        return None
+
+    with SessionLocal() as db:
+        customer = db.get(CustomerProfile, customer_id)
+        if not customer:
+            print(f"[AUTO_ESCALATE] Customer {customer_id} not found - skipping")
+            return None
+
+        tier_label, engine_tier = _tier_from_score(risk_score)
+        if engine_tier < 2:
+            # Only escalate for CRITICAL (tier 2) and VERY_CRITICAL (tier 3)
+            return None
+
+        # Check for recent duplicate to avoid spamming the same customer
+        if not _no_duplicate_recent(db, customer_id, engine_tier):
+            print(f"[AUTO_ESCALATE] {customer_id} already escalated recently (tier {engine_tier})")
+            return None
+
+        # Create intervention queue item
+        status = "APPROVED"  # auto-approved for immediate dispatch
+        row = InterventionQueue(
+            customer_id=customer_id,
+            risk_score=risk_score,
+            tier_label=tier_label,
+            engine_tier=engine_tier,
+            status=status,
+            delivery_status="QUEUED",
+            approved_by=actor,
+            approved_at=_utcnow(),
+            maker_id=actor,
+            rm_escalation_flag=True,
+            collections_flag=engine_tier == 3,
+            response_due_at=_utcnow() + timedelta(hours=ENGINE_SLA_HOURS[engine_tier]),
+        )
+        db.add(row)
+        db.flush()
+
+        _append_audit(
+            db,
+            intervention_id=row.id,
+            customer_id=customer_id,
+            action="AUTO_ESCALATION_CREATED",
+            actor=actor,
+            details={"score": risk_score, "tier": tier_label, "engine_tier": engine_tier},
+        )
+        db.commit()
+
+        # Immediately dispatch the email
+        try:
+            result = _execute_send(db, row, actor=actor, schedule_at=None)
+            print(
+                f"[AUTO_ESCALATE] {customer_id} | Score: {risk_score:.2f} | "
+                f"Tier: {tier_label} | Engine: {engine_tier} | Status: {result.get('status')}"
+            )
+            return {
+                "customer_id": customer_id,
+                "risk_score": risk_score,
+                "tier": tier_label,
+                "engine_tier": engine_tier,
+                "intervention_id": row.id,
+                "send_result": result,
+            }
+        except Exception as exc:
+            print(f"[AUTO_ESCALATE] Email send failed for {customer_id}: {exc}")
+            return {
+                "customer_id": customer_id,
+                "risk_score": risk_score,
+                "error": str(exc),
+            }
+
+
+def send_manual_intervention_email(
+    customer_id: str,
+    admin_id: str = "admin",
+    engine_tier: int | None = None,
+) -> dict:
+    """Admin-triggered manual email to a specific customer.
+
+    If no engine_tier is provided, it is determined from the customer's latest
+    risk score in the database.
+    """
+    with SessionLocal() as db:
+        customer = db.get(CustomerProfile, customer_id)
+        if not customer:
+            raise ValueError(f"Customer {customer_id} not found")
+
+        # Get latest risk score
+        latest_score_row = (
+            db.query(RiskScore)
+            .filter(RiskScore.customer_id == customer_id)
+            .order_by(RiskScore.created_at.desc())
+            .first()
+        )
+        score = float(latest_score_row.risk_score) if latest_score_row else 50.0
+
+        if engine_tier is None:
+            _, engine_tier = _tier_from_score(score)
+            engine_tier = max(1, engine_tier)  # at least tier 1 (advisory)
+
+        tier_label, _ = _tier_from_score(score)
+
+        row = InterventionQueue(
+            customer_id=customer_id,
+            risk_score=score,
+            tier_label=tier_label,
+            engine_tier=engine_tier,
+            status="APPROVED",
+            delivery_status="QUEUED",
+            approved_by=admin_id,
+            approved_at=_utcnow(),
+            maker_id=admin_id,
+            rm_escalation_flag=engine_tier >= 2,
+            collections_flag=engine_tier == 3,
+            response_due_at=_utcnow() + timedelta(hours=ENGINE_SLA_HOURS.get(engine_tier, 48)),
+        )
+        db.add(row)
+        db.flush()
+
+        _append_audit(
+            db,
+            intervention_id=row.id,
+            customer_id=customer_id,
+            action="MANUAL_SEND_CREATED",
+            actor=admin_id,
+            details={"score": score, "tier": tier_label, "engine_tier": engine_tier},
+        )
+        db.commit()
+
+        result = _execute_send(db, row, actor=admin_id, schedule_at=None)
+        return {
+            "customer_id": customer_id,
+            "risk_score": score,
+            "engine_tier": engine_tier,
+            "intervention_id": row.id,
+            "send_result": result,
+        }
+
+
 def _orchestrator_job() -> None:
     with SessionLocal() as db:
         orchestrate_from_latest_scores(db, actor="orchestrator")

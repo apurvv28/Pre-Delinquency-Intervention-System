@@ -189,7 +189,7 @@ export default function Dashboard() {
             <h3 className="font-syne text-xl text-[#0F172A]">Restart Stream?</h3>
             <p className="mt-2 text-sm text-[#475569]">
               This will delete all existing stream data and transactions, then restart from 0 transactions for all customers.
-              The stream will reflow through the ML models (LightGBM + XGBoost fusion) to recalculate risk scores.
+              The stream will reflow through the sequential LightGBM -&gt; XGBoost pipeline to recalculate risk scores.
             </p>
             <div className="mt-4 flex gap-2 justify-end">
               <button

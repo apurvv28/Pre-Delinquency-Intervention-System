@@ -16,7 +16,7 @@ async def get_model_monitoring(db: Session = Depends(get_db)):
 
 @router.get("/both")
 async def get_both_models_monitoring(db: Session = Depends(get_db)):
-    """Get monitoring data for both base model (LightGBM) and contextual model (XGBoost)."""
+    """Get monitoring data for the sequential LightGBM base stage and XGBoost finalizer."""
     base_model_monitoring = build_monitoring_report(db)
     contextual_model_monitoring = get_contextual_model_monitoring(db)
     
@@ -27,7 +27,7 @@ async def get_both_models_monitoring(db: Session = Depends(get_db)):
             **base_model_monitoring,
         },
         "contextualModel": {
-            "name": "XGBoost Contextual Model",
+            "name": "Sequential XGBoost Finalizer",
             "type": "xgboost",
             **contextual_model_monitoring,
         },
