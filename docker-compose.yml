@@ -3,7 +3,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    image: apurvv28/pie-backend:latest
+    image: apurv28/pre-delinquency-intervention-system:backend
     container_name: pie-backend
     restart: unless-stopped
     environment:
@@ -34,7 +34,7 @@ services:
       dockerfile: Dockerfile
       args:
         VITE_API_BASE_URL: /api
-    image: apurvv28/pie-frontend:latest
+    image: apurv28/pre-delinquency-intervention-system:frontend
     container_name: pie-frontend
     restart: unless-stopped
     depends_on:
